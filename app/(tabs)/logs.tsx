@@ -1,180 +1,190 @@
 import React from 'react';
 import {
-  View,
-  Text,
-  FlatList,
-  TouchableOpacity,
   Alert,
+  FlatList,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
-import { useAppStore } from '@/lib/store';
 import { useColors } from '@/hooks/use-colors';
+import { useAppStore } from '@/lib/store';
+import { ToolLog } from '@/lib/types';
 
-/**
- * 日志查看屏幕
- */
 export default function LogsScreen() {
   const colors = useColors();
-  const { toolLogs, clearToolLogs, getRecentToolLogs } = useAppStore();
+  const { logs, clearLogs } = useAppStore();
 
-  const recentLogs = getRecentToolLogs(50);
+  const handleClear = () => {
+    Alert.alert('清除日志', '确定要清除所有工具调用日志吗？', [
+      { text: '取消', style: 'cancel' },
+      { text: '清除', style: 'destructive', onPress: clearLogs },
+    ]);
+  };
 
-  const handleClearLogs = () => {
-    Alert.alert(
-      'Clear Logs',
-      'Are you sure you want to clear all logs?',
-      [
-        { text: 'Cancel', onPress: () => {} },
-        {
-          text: 'Clear',
-          onPress: () => {
-            clearToolLogs();
-            Alert.alert('Success', 'Logs cleared');
+  const renderLog = ({ item }: { item: ToolLog }) => {
+    const isSuccess = item.result.success;
+    const time = new Date(item.timestamp).toLocaleTimeString('zh-CN');
+    const date = new Date(item.timestamp).toLocaleDateString('zh-CN');
+
+    return (
+      <View
+        style={[
+          styles.logCard,
+          {
+            backgroundColor: colors.surface,
+            borderColor: isSuccess ? colors.success : colors.error,
           },
-          style: 'destructive',
-        },
-      ]
+        ]}
+        accessible
+        accessibilityLabel={`工具日志：${item.toolName}，${isSuccess ? '成功' : '失败'}，${date} ${time}，耗时 ${item.executionTimeMs} 毫秒`}
+      >
+        <View style={styles.logHeader}>
+          <View style={styles.logTitleRow}>
+            <Text style={[styles.logToolName, { color: colors.foreground }]}>
+              {item.toolName}
+            </Text>
+            <View
+              style={[
+                styles.statusBadge,
+                { backgroundColor: isSuccess ? colors.success + '33' : colors.error + '33' },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.statusText,
+                  { color: isSuccess ? colors.success : colors.error },
+                ]}
+              >
+                {isSuccess ? '✓ 成功' : '✗ 失败'}
+              </Text>
+            </View>
+          </View>
+          <Text style={[styles.logMeta, { color: colors.muted }]}>
+            {item.toolCategory} · {date} {time} · {item.executionTimeMs}ms
+            {item.userConfirmed ? ' · 已确认' : ''}
+          </Text>
+        </View>
+
+        {Object.keys(item.parameters).length > 0 && (
+          <View style={[styles.codeBlock, { backgroundColor: colors.background }]}>
+            <Text style={[styles.codeLabel, { color: colors.muted }]}>参数</Text>
+            <Text
+              style={[styles.codeText, { color: colors.foreground }]}
+              accessibilityLabel={`参数：${JSON.stringify(item.parameters)}`}
+            >
+              {JSON.stringify(item.parameters, null, 2)}
+            </Text>
+          </View>
+        )}
+
+        <View style={[styles.codeBlock, { backgroundColor: colors.background }]}>
+          <Text style={[styles.codeLabel, { color: colors.muted }]}>结果</Text>
+          {item.result.error ? (
+            <Text
+              style={[styles.codeText, { color: colors.error }]}
+              accessibilityLabel={`错误：${item.result.error}`}
+            >
+              {item.result.error}
+            </Text>
+          ) : (
+            <Text
+              style={[styles.codeText, { color: colors.success }]}
+              accessibilityLabel={`结果：${JSON.stringify(item.result.data)}`}
+            >
+              {JSON.stringify(item.result.data, null, 2)}
+            </Text>
+          )}
+        </View>
+      </View>
     );
   };
 
   return (
-    <ScreenContainer className="flex-1 bg-background">
-      {/* 标题 */}
-      <View className="px-4 py-4 border-b border-border flex-row items-center justify-between">
-        <View className="flex-1">
-          <Text className="text-2xl font-bold text-foreground mb-2">📋 Tool Logs</Text>
-          <Text className="text-sm text-muted">
-            Recent tool execution history (last 50 entries)
+    <ScreenContainer>
+      <View style={[styles.header, { borderBottomColor: colors.border }]}>
+        <View>
+          <Text
+            style={[styles.headerTitle, { color: colors.foreground }]}
+            accessibilityRole="header"
+          >
+            工具调用日志
+          </Text>
+          <Text style={[styles.headerSub, { color: colors.muted }]}>
+            最近 {logs.length} 条记录（最多保留 50 条）
           </Text>
         </View>
-        <TouchableOpacity
-          onPress={handleClearLogs}
-          disabled={recentLogs.length === 0}
-          className={`px-3 py-2 rounded-lg ${
-            recentLogs.length === 0
-              ? 'bg-border opacity-50'
-              : 'bg-error/10 border border-error'
-          }`}
-          accessible={true}
-          accessibilityRole="button"
-          accessibilityLabel="Clear all logs"
-        >
-          <Text className={`text-xs font-semibold ${
-            recentLogs.length === 0 ? 'text-muted' : 'text-error'
-          }`}>
-            Clear
-          </Text>
-        </TouchableOpacity>
+        {logs.length > 0 && (
+          <TouchableOpacity
+            style={[styles.clearBtn, { borderColor: colors.error }]}
+            onPress={handleClear}
+            accessible
+            accessibilityRole="button"
+            accessibilityLabel="清除所有日志"
+            accessibilityHint="双击清除所有工具调用日志"
+          >
+            <Text style={[styles.clearBtnText, { color: colors.error }]}>清除</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
-      {/* 日志列表 */}
-      {recentLogs.length === 0 ? (
-        <View className="flex-1 items-center justify-center px-4">
-          <Text className="text-center text-lg font-semibold text-foreground mb-2">
-            No Logs Yet
-          </Text>
-          <Text className="text-center text-sm text-muted">
-            Tool execution logs will appear here
+      {logs.length === 0 ? (
+        <View
+          style={styles.emptyState}
+          accessible
+          accessibilityLabel="暂无日志，工具调用记录将显示在此处"
+        >
+          <Text style={[styles.emptyIcon, { color: colors.muted }]}>📋</Text>
+          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>暂无日志</Text>
+          <Text style={[styles.emptyDesc, { color: colors.muted }]}>
+            AI 调用工具后，执行记录将显示在此处
           </Text>
         </View>
       ) : (
         <FlatList
-          data={recentLogs}
+          data={[...logs].reverse()}
           keyExtractor={(item) => item.id}
-          contentContainerStyle={{ padding: 16, gap: 12 }}
-          renderItem={({ item }) => (
-            <View
-              className={`rounded-lg p-4 border ${
-                item.result.success
-                  ? 'bg-success/10 border-success'
-                  : 'bg-error/10 border-error'
-              }`}
-              accessible={true}
-              accessibilityRole="list"
-              accessibilityLabel={`Tool log: ${item.toolName}`}
-            >
-              {/* 工具名称和状态 */}
-              <View className="flex-row items-center justify-between mb-2">
-                <Text className="text-lg font-bold text-foreground">
-                  {item.toolName}
-                </Text>
-                <Text
-                  className={`text-xs font-semibold px-2 py-1 rounded ${
-                    item.result.success
-                      ? 'bg-success/20 text-success'
-                      : 'bg-error/20 text-error'
-                  }`}
-                  accessible={true}
-                  accessibilityLabel={`Status: ${item.result.success ? 'Success' : 'Failed'}`}
-                >
-                  {item.result.success ? '✓ Success' : '✗ Failed'}
-                </Text>
-              </View>
-
-              {/* 工具类别 */}
-              <Text className="text-sm text-muted mb-2">
-                Category: {item.toolCategory}
-              </Text>
-
-              {/* 时间戳 */}
-              <Text className="text-xs text-muted mb-3">
-                Time: {new Date(item.timestamp).toLocaleString()}
-              </Text>
-
-              {/* 执行时间 */}
-              <Text className="text-xs text-muted mb-3">
-                Duration: {item.executionTime}ms
-              </Text>
-
-              {/* 参数 */}
-              {Object.keys(item.parameters).length > 0 && (
-                <View className="mb-3 p-2 bg-background rounded">
-                  <Text className="text-xs font-semibold text-muted mb-1">Parameters:</Text>
-                  {Object.entries(item.parameters).map(([key, value]) => (
-                    <Text
-                      key={key}
-                      className="text-xs text-muted font-mono"
-                      accessible={true}
-                      accessibilityLabel={`Parameter ${key}: ${String(value)}`}
-                    >
-                      {key}: {typeof value === 'string' ? value : JSON.stringify(value)}
-                    </Text>
-                  ))}
-                </View>
-              )}
-
-              {/* 结果 */}
-              <View className="p-2 bg-background rounded">
-                <Text className="text-xs font-semibold text-muted mb-1">Result:</Text>
-                {item.result.error ? (
-                  <Text
-                    className="text-xs text-error font-mono"
-                    accessible={true}
-                    accessibilityLabel={`Error: ${item.result.error}`}
-                  >
-                    Error: {item.result.error}
-                  </Text>
-                ) : (
-                  <Text
-                    className="text-xs text-success font-mono"
-                    accessible={true}
-                    accessibilityLabel={`Result: ${JSON.stringify(item.result.data)}`}
-                  >
-                    {JSON.stringify(item.result.data, null, 2)}
-                  </Text>
-                )}
-              </View>
-
-              {/* 用户确认状态 */}
-              <View className="mt-3 pt-3 border-t border-border">
-                <Text className="text-xs text-muted">
-                  User Confirmed: {item.userConfirmed ? '✓ Yes' : '✗ No'}
-                </Text>
-              </View>
-            </View>
-          )}
+          renderItem={renderLog}
+          contentContainerStyle={styles.list}
+          accessible={false}
         />
       )}
     </ScreenContainer>
   );
 }
+
+const styles = StyleSheet.create({
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+  },
+  headerTitle: { fontSize: 22, fontWeight: '700' },
+  headerSub: { fontSize: 13, marginTop: 2 },
+  clearBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  clearBtnText: { fontSize: 14, fontWeight: '600' },
+  list: { padding: 16, gap: 12, paddingBottom: 32 },
+  logCard: { borderRadius: 12, padding: 14, borderWidth: 1, gap: 10 },
+  logHeader: { gap: 4 },
+  logTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  logToolName: { fontSize: 16, fontWeight: '600' },
+  statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  statusText: { fontSize: 12, fontWeight: '600' },
+  logMeta: { fontSize: 12, lineHeight: 18 },
+  codeBlock: { borderRadius: 8, padding: 10, gap: 4 },
+  codeLabel: { fontSize: 11, fontWeight: '600', textTransform: 'uppercase' },
+  codeText: { fontSize: 12, fontFamily: 'monospace', lineHeight: 18 },
+  emptyState: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 12 },
+  emptyIcon: { fontSize: 48 },
+  emptyTitle: { fontSize: 20, fontWeight: '700' },
+  emptyDesc: { fontSize: 14, textAlign: 'center', lineHeight: 22 },
+});

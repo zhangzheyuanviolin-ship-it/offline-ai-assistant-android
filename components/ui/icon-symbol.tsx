@@ -1,30 +1,76 @@
 // Fallback for using MaterialIcons on Android and web.
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import { SymbolViewProps, SymbolWeight } from 'expo-symbols';
+import { ComponentProps } from 'react';
+import { OpaqueColorValue, StyleProp, TextStyle } from 'react-native';
 
-import MaterialIcons from "@expo/vector-icons/MaterialIcons";
-import { SymbolWeight, SymbolViewProps } from "expo-symbols";
-import { ComponentProps } from "react";
-import { OpaqueColorValue, type StyleProp, type TextStyle } from "react-native";
-
-type IconMapping = Record<SymbolViewProps["name"], ComponentProps<typeof MaterialIcons>["name"]>;
+type IconMapping = Record<string, ComponentProps<typeof MaterialIcons>['name']>;
 type IconSymbolName = keyof typeof MAPPING;
 
 /**
- * Add your SF Symbols to Material Icons mappings here.
- * - see Material Icons in the [Icons Directory](https://icons.expo.fyi).
- * - see SF Symbols in the [SF Symbols](https://developer.apple.com/sf-symbols/) app.
+ * SF Symbols → Material Icons 映射表
+ * 添加新图标时，在此处增加映射即可
  */
-const MAPPING = {
-  "house.fill": "home",
-  "paperplane.fill": "send",
-  "chevron.left.forwardslash.chevron.right": "code",
-  "chevron.right": "chevron-right",
-} as IconMapping;
+const MAPPING: IconMapping = {
+  // 导航
+  'house.fill': 'home',
+  'paperplane.fill': 'send',
+  'chevron.left.forwardslash.chevron.right': 'code',
+  'chevron.right': 'chevron-right',
+  'chevron.left': 'chevron-left',
+  'chevron.down': 'expand-more',
+  'chevron.up': 'expand-less',
 
-/**
- * An icon component that uses native SF Symbols on iOS, and Material Icons on Android and web.
- * This ensures a consistent look across platforms, and optimal resource usage.
- * Icon `name`s are based on SF Symbols and require manual mapping to Material Icons.
- */
+  // 聊天 / 消息
+  'message.fill': 'chat',
+  'bubble.left.fill': 'chat-bubble',
+  'bubble.right.fill': 'chat-bubble-outline',
+
+  // 模型 / 文件
+  'cube.fill': 'view-in-ar',
+  'doc.fill': 'description',
+  'folder.fill': 'folder',
+  'tray.and.arrow.down.fill': 'download',
+  'tray.and.arrow.up.fill': 'upload',
+
+  // 工具 / 设置
+  'wrench.fill': 'build',
+  'gearshape.fill': 'settings',
+  'slider.horizontal.3': 'tune',
+  'toggles': 'toggle-on',
+
+  // 日志 / 列表
+  'list.bullet.rectangle': 'list-alt',
+  'doc.text.fill': 'article',
+
+  // 状态
+  'checkmark.circle.fill': 'check-circle',
+  'xmark.circle.fill': 'cancel',
+  'exclamationmark.triangle.fill': 'warning',
+  'info.circle.fill': 'info',
+
+  // 媒体
+  'play.fill': 'play-arrow',
+  'pause.fill': 'pause',
+  'stop.fill': 'stop',
+  'mic.fill': 'mic',
+  'video.fill': 'videocam',
+
+  // 搜索
+  'magnifyingglass': 'search',
+
+  // 其他
+  'trash.fill': 'delete',
+  'plus': 'add',
+  'minus': 'remove',
+  'arrow.up': 'arrow-upward',
+  'arrow.down': 'arrow-downward',
+  'arrow.clockwise': 'refresh',
+  'square.and.arrow.up': 'share',
+  'lock.fill': 'lock',
+  'person.fill': 'person',
+};
+
 export function IconSymbol({
   name,
   size = 24,
@@ -37,5 +83,6 @@ export function IconSymbol({
   style?: StyleProp<TextStyle>;
   weight?: SymbolWeight;
 }) {
-  return <MaterialIcons color={color} size={size} name={MAPPING[name]} style={style} />;
+  const materialName = MAPPING[name as string] ?? 'help-outline';
+  return <MaterialIcons color={color} size={size} name={materialName} style={style} />;
 }

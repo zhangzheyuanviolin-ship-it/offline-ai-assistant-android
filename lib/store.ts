@@ -1,12 +1,25 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
-import { AIModel, InferenceParams, ToolsConfig, ChatMessage, ToolLog, AppState } from './types';
+import {
+  AIModel,
+  AppState,
+  ChatMessage,
+  DEFAULT_INFERENCE_PARAMS,
+  DEFAULT_TOOLS_CONFIG,
+  InferenceParams,
+  SearchEngine,
+  ToolCall,
+  ToolLog,
+  ToolsConfig,
+} from './types';
 
 interface AppStore extends AppState {
   // 模型管理
-  setCurrentModel: (model: AIModel | null) => void;
   addModel: (model: AIModel) => void;
   removeModel: (modelId: string) => void;
-  updateModels: (models: AIModel[]) => void;
+  setActiveModel: (modelId: string | null) => void;
+  setModelLoaded: (modelId: string, loaded: boolean) => void;
+  loadModelsFromStorage: () => Promise<void>;
 
   // 推理参数
   setInferenceParams: (params: Partial<InferenceParams>) => void;
@@ -14,138 +27,206 @@ interface AppStore extends AppState {
   // 工具配置
   setToolsConfig: (config: Partial<ToolsConfig>) => void;
   toggleToolCategory: (category: 'WebSearch' | 'Files' | 'Media') => void;
-  setSearchEngine: (engine: 'international' | 'domestic') => void;
+  setSearchEngine: (engine: SearchEngine) => void;
+  setSearchApiKey: (provider: 'tavily' | 'exa', key: string) => void;
+  setSearchMaxResults: (n: number) => void;
 
   // 聊天消息
-  addChatMessage: (message: ChatMessage) => void;
-  updateChatMessage: (messageId: string, updates: Partial<ChatMessage>) => void;
-  clearChatMessages: () => void;
+  addMessage: (message: ChatMessage) => void;
+  updateMessage: (messageId: string, updates: Partial<ChatMessage>) => void;
+  updateToolCall: (messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
+  clearMessages: () => void;
 
   // 工具日志
-  addToolLog: (log: ToolLog) => void;
-  clearToolLogs: () => void;
-  getRecentToolLogs: (limit: number) => ToolLog[];
+  addLog: (log: ToolLog) => void;
+  clearLogs: () => void;
 
   // 推理状态
-  setIsInferencing: (isInferencing: boolean) => void;
+  setGenerating: (generating: boolean) => void;
+  setContextId: (id: string | null) => void;
   setError: (error: string | null) => void;
 }
 
-const initialInferenceParams: InferenceParams = {
-  n_ctx: 2048,
-  threads: 4,
-  n_gpu_layers: 0,
-  gpu_enabled: false,
-};
-
-const initialToolsConfig: ToolsConfig = {
-  WebSearch: {
-    enabled: true,
-    engine: 'international',
-    permissionLevel: 'ASK',
-  },
-  Files: {
-    enabled: true,
-    permissionLevel: 'ASK',
-  },
-  Media: {
-    enabled: true,
-    permissionLevel: 'ASK',
-  },
-};
-
 export const useAppStore = create<AppStore>((set, get) => ({
-  // 初始状态
-  currentModel: null,
+  // ─── Initial State ────────────────────────────────────────────────────────
   models: [],
-  inferenceParams: initialInferenceParams,
-  toolsConfig: initialToolsConfig,
-  chatMessages: [],
-  toolLogs: [],
-  isInferencing: false,
+  activeModelId: null,
+  inferenceParams: DEFAULT_INFERENCE_PARAMS,
+  toolsConfig: DEFAULT_TOOLS_CONFIG,
+  messages: [],
+  logs: [],
+  isGenerating: false,
+  contextId: null,
   error: null,
 
-  // 模型管理
-  setCurrentModel: (model) => set({ currentModel: model }),
+  // ─── Model Management ─────────────────────────────────────────────────────
+  addModel: (model) => {
+    set((state) => {
+      const updated = [...state.models, model];
+      AsyncStorage.setItem('models', JSON.stringify(updated)).catch(() => {});
+      return { models: updated };
+    });
+  },
 
-  addModel: (model) =>
+  removeModel: (modelId) => {
+    set((state) => {
+      const updated = state.models.filter((m) => m.id !== modelId);
+      AsyncStorage.setItem('models', JSON.stringify(updated)).catch(() => {});
+      const activeModelId = state.activeModelId === modelId ? null : state.activeModelId;
+      return { models: updated, activeModelId };
+    });
+  },
+
+  setActiveModel: (modelId) => {
+    set({ activeModelId: modelId });
+    AsyncStorage.setItem('activeModelId', modelId ?? '').catch(() => {});
+  },
+
+  setModelLoaded: (modelId, loaded) => {
     set((state) => ({
-      models: [...state.models, model],
-    })),
+      models: state.models.map((m) =>
+        m.id === modelId ? { ...m, isLoaded: loaded } : m
+      ),
+    }));
+  },
 
-  removeModel: (modelId) =>
-    set((state) => ({
-      models: state.models.filter((m) => m.id !== modelId),
-      currentModel: state.currentModel?.id === modelId ? null : state.currentModel,
-    })),
+  loadModelsFromStorage: async () => {
+    try {
+      const [modelsJson, activeId, paramsJson, toolsJson] = await Promise.all([
+        AsyncStorage.getItem('models'),
+        AsyncStorage.getItem('activeModelId'),
+        AsyncStorage.getItem('inferenceParams'),
+        AsyncStorage.getItem('toolsConfig'),
+      ]);
+      const models: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
+      const inferenceParams = paramsJson
+        ? { ...DEFAULT_INFERENCE_PARAMS, ...JSON.parse(paramsJson) }
+        : DEFAULT_INFERENCE_PARAMS;
+      const toolsConfig = toolsJson
+        ? { ...DEFAULT_TOOLS_CONFIG, ...JSON.parse(toolsJson) }
+        : DEFAULT_TOOLS_CONFIG;
+      set({
+        models: models.map((m) => ({ ...m, isLoaded: false })),
+        activeModelId: activeId || null,
+        inferenceParams,
+        toolsConfig,
+      });
+    } catch {
+      // ignore storage errors
+    }
+  },
 
-  updateModels: (models) => set({ models }),
+  // ─── Inference Params ─────────────────────────────────────────────────────
+  setInferenceParams: (params) => {
+    set((state) => {
+      const updated = { ...state.inferenceParams, ...params };
+      AsyncStorage.setItem('inferenceParams', JSON.stringify(updated)).catch(() => {});
+      return { inferenceParams: updated };
+    });
+  },
 
-  // 推理参数
-  setInferenceParams: (params) =>
-    set((state) => ({
-      inferenceParams: { ...state.inferenceParams, ...params },
-    })),
+  // ─── Tool Config ──────────────────────────────────────────────────────────
+  setToolsConfig: (config) => {
+    set((state) => {
+      const updated = { ...state.toolsConfig, ...config };
+      AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
+      return { toolsConfig: updated };
+    });
+  },
 
-  // 工具配置
-  setToolsConfig: (config) =>
-    set((state) => ({
-      toolsConfig: { ...state.toolsConfig, ...config },
-    })),
-
-  toggleToolCategory: (category) =>
-    set((state) => ({
-      toolsConfig: {
+  toggleToolCategory: (category) => {
+    set((state) => {
+      const updated = {
         ...state.toolsConfig,
         [category]: {
           ...state.toolsConfig[category],
           enabled: !state.toolsConfig[category].enabled,
         },
-      },
-    })),
-
-  setSearchEngine: (engine) =>
-    set((state) => ({
-      toolsConfig: {
-        ...state.toolsConfig,
-        WebSearch: {
-          ...state.toolsConfig.WebSearch,
-          engine,
-        },
-      },
-    })),
-
-  // 聊天消息
-  addChatMessage: (message) =>
-    set((state) => ({
-      chatMessages: [...state.chatMessages, message],
-    })),
-
-  updateChatMessage: (messageId, updates) =>
-    set((state) => ({
-      chatMessages: state.chatMessages.map((msg) =>
-        msg.id === messageId ? { ...msg, ...updates } : msg
-      ),
-    })),
-
-  clearChatMessages: () => set({ chatMessages: [] }),
-
-  // 工具日志
-  addToolLog: (log) =>
-    set((state) => {
-      const logs = [...state.toolLogs, log];
-      // 只保留最近 50 条
-      return { toolLogs: logs.slice(-50) };
-    }),
-
-  clearToolLogs: () => set({ toolLogs: [] }),
-
-  getRecentToolLogs: (limit) => {
-    const state = get();
-    return state.toolLogs.slice(-limit);
+      };
+      AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
+      return { toolsConfig: updated };
+    });
   },
 
-  // 推理状态
-  setIsInferencing: (isInferencing) => set({ isInferencing }),
+  setSearchEngine: (engine) => {
+    set((state) => {
+      const updated = {
+        ...state.toolsConfig,
+        WebSearch: { ...state.toolsConfig.WebSearch, engine },
+      };
+      AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
+      return { toolsConfig: updated };
+    });
+  },
+
+  setSearchApiKey: (provider, key) => {
+    set((state) => {
+      const field = provider === 'tavily' ? 'tavilyApiKey' : 'exaApiKey';
+      const updated = {
+        ...state.toolsConfig,
+        WebSearch: { ...state.toolsConfig.WebSearch, [field]: key },
+      };
+      AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
+      return { toolsConfig: updated };
+    });
+  },
+
+  setSearchMaxResults: (n) => {
+    set((state) => {
+      const updated = {
+        ...state.toolsConfig,
+        WebSearch: { ...state.toolsConfig.WebSearch, maxResults: Math.max(1, Math.min(20, n)) },
+      };
+      AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
+      return { toolsConfig: updated };
+    });
+  },
+
+  // ─── Messages ─────────────────────────────────────────────────────────────
+  addMessage: (message) => {
+    set((state) => ({ messages: [...state.messages, message] }));
+  },
+
+  updateMessage: (messageId, updates) => {
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === messageId ? { ...m, ...updates } : m
+      ),
+    }));
+  },
+
+  updateToolCall: (messageId, toolCallId, updates) => {
+    set((state) => ({
+      messages: state.messages.map((m) => {
+        if (m.id !== messageId || !m.toolCalls) return m;
+        return {
+          ...m,
+          toolCalls: m.toolCalls.map((tc) =>
+            tc.id === toolCallId ? { ...tc, ...updates } : tc
+          ),
+        };
+      }),
+    }));
+  },
+
+  clearMessages: () => set({ messages: [] }),
+
+  // ─── Logs ─────────────────────────────────────────────────────────────────
+  addLog: (log) => {
+    set((state) => {
+      const updated = [...state.logs, log].slice(-50); // 最多保留 50 条
+      return { logs: updated };
+    });
+  },
+
+  clearLogs: () => set({ logs: [] }),
+
+  // ─── Inference State ──────────────────────────────────────────────────────
+  setGenerating: (isGenerating) => set({ isGenerating }),
+  setContextId: (contextId) => set({ contextId }),
   setError: (error) => set({ error }),
 }));
+
+// 便捷选择器
+export const selectActiveModel = (state: AppStore) =>
+  state.models.find((m) => m.id === state.activeModelId) ?? null;

@@ -1,324 +1,618 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ScrollView,
-  Text,
-  View,
-  TextInput,
-  TouchableOpacity,
+  ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
-  ActivityIndicator,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { ScreenContainer } from '@/components/screen-container';
-import { useAppStore } from '@/lib/store';
 import { useColors } from '@/hooks/use-colors';
-import { ChatMessage } from '@/components/chat-message';
+import { useAppStore, selectActiveModel } from '@/lib/store';
+import { getActiveContext } from '@/lib/services/model-service';
+import {
+  buildCompactSystemPrompt,
+  executeTool,
+  getToolCategory,
+  parseToolCalls,
+  toolRequiresConfirmation,
+} from '@/lib/services/tools-service';
+import { ChatMessage, ToolCall, ToolLog } from '@/lib/types';
 import { ToolConfirmationModal } from '@/components/tool-confirmation-modal';
-import { initializeModelsDirectory } from '@/lib/services/model-service';
-import * as DocumentPicker from 'expo-document-picker';
 import { router } from 'expo-router';
-import { useIsFocused } from '@react-navigation/native';
+
+// ─── Inference Engine ─────────────────────────────────────────────────────────
 
 /**
- * 主聊天屏幕
+ * 运行本地推理，支持极简工具调用格式
+ * 工具调用格式：{"t":"工具名","p":{参数}}
  */
-export default function HomeScreen() {
-  const colors = useColors();
-  const isFocused = useIsFocused();
-  
-  // 状态
-  const [messageText, setMessageText] = useState('');
-  const [showToolConfirmation, setShowToolConfirmation] = useState(false);
-  const [selectedToolCall, setSelectedToolCall] = useState<any>(null);
-  const scrollViewRef = useRef<ScrollView>(null);
+async function runInference(
+  userText: string,
+  history: ChatMessage[],
+  toolsConfig: ReturnType<typeof useAppStore.getState>['toolsConfig'],
+  inferenceParams: ReturnType<typeof useAppStore.getState>['inferenceParams'],
+  onToken: (token: string) => void,
+  onToolCall: (call: ToolCall) => Promise<string>
+): Promise<string> {
+  const ctx = getActiveContext();
+  if (!ctx) throw new Error('没有已加载的模型，请先在"模型"页面加载一个 GGUF 模型');
 
-  // Store
+  // 构建极简系统提示（工具描述 < 200 token）
+  const toolPrompt = buildCompactSystemPrompt(toolsConfig);
+  const systemContent = `你是一个离线 AI 助手，运行在用户手机上。简洁回答，必要时调用工具。${toolPrompt}`;
+
+  // 构建消息历史（仅保留最近 10 轮，节省上下文）
+  const recentHistory = history
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .slice(-20);
+
+  const msgs: Array<{ role: string; content: string }> = [
+    { role: 'system', content: systemContent },
+    ...recentHistory.map((m) => ({ role: m.role as string, content: m.content })),
+    { role: 'user', content: userText },
+  ];
+
+  let fullResponse = '';
+  let toolCallRound = 0;
+  const MAX_TOOL_ROUNDS = 3; // 最多 3 轮工具调用，防止无限循环
+
+  while (toolCallRound <= MAX_TOOL_ROUNDS) {
+    let roundText = '';
+
+    await ctx.completion(
+      {
+        messages: msgs as Parameters<typeof ctx.completion>[0]['messages'],
+        n_predict: inferenceParams.max_tokens,
+        temperature: inferenceParams.temperature,
+        top_p: inferenceParams.top_p,
+        top_k: inferenceParams.top_k,
+        penalty_repeat: inferenceParams.repeat_penalty,
+        stop: [...inferenceParams.stop, '{"t":', '```json'],
+      },
+      (data: { token: string }) => {
+        roundText += data.token;
+        // 只在第一轮流式输出给用户
+        if (toolCallRound === 0) {
+          fullResponse += data.token;
+          onToken(data.token);
+        }
+      }
+    );
+
+    if (toolCallRound > 0) {
+      fullResponse += roundText;
+    }
+
+    // 解析工具调用
+    const toolCalls = parseToolCalls(roundText);
+    if (toolCalls.length === 0) break; // 没有工具调用，结束
+
+    toolCallRound++;
+    if (toolCallRound > MAX_TOOL_ROUNDS) break;
+
+    // 执行工具调用
+    const toolResults: string[] = [];
+    for (const tc of toolCalls) {
+      const category = getToolCategory(tc.toolName) ?? 'Files';
+      const toolCall: ToolCall = {
+        id: `tc_${Date.now()}_${tc.toolName}`,
+        toolName: tc.toolName,
+        toolCategory: category,
+        parameters: tc.parameters,
+        status: 'pending',
+      };
+
+      const resultStr = await onToolCall(toolCall);
+      toolResults.push(`[${tc.toolName}结果]: ${resultStr}`);
+    }
+
+    // 将工具结果注入到消息历史，继续推理
+    const toolResultContent = toolResults.join('\n');
+    msgs.push({ role: 'assistant', content: roundText });
+    msgs.push({ role: 'user', content: `工具执行完成：\n${toolResultContent}\n\n请根据以上结果继续回答。` });
+
+    // 通知用户工具正在执行
+    const toolNotice = `\n\n[正在执行工具: ${toolCalls.map((t) => t.toolName).join(', ')}...]\n`;
+    fullResponse += toolNotice;
+    onToken(toolNotice);
+  }
+
+  return fullResponse;
+}
+
+// ─── Chat Screen ──────────────────────────────────────────────────────────────
+
+export default function ChatScreen() {
+  const colors = useColors();
+  const [inputText, setInputText] = useState('');
+  const [pendingToolCall, setPendingToolCall] = useState<ToolCall | null>(null);
+  const [resolveToolCall, setResolveToolCall] = useState<((result: string) => void) | null>(null);
+  const flatListRef = useRef<FlatList>(null);
+
   const {
-    currentModel,
-    chatMessages,
-    isInferencing,
+    messages,
+    isGenerating,
     toolsConfig,
-    addChatMessage,
+    inferenceParams,
+    addMessage,
+    updateMessage,
+    addLog,
+    setGenerating,
+    setError,
   } = useAppStore();
 
-  // 初始化
-  useEffect(() => {
-    const init = async () => {
-      try {
-        await initializeModelsDirectory();
-      } catch (error) {
-        console.error('Failed to initialize:', error);
-      }
-    };
-    init();
-  }, []);
+  const activeModel = useAppStore(selectActiveModel);
 
   // 滚动到底部
+  const scrollToBottom = useCallback(() => {
+    setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+  }, []);
+
   useEffect(() => {
-    if (chatMessages.length > 0) {
-      setTimeout(() => {
-        scrollViewRef.current?.scrollToEnd({ animated: true });
-      }, 100);
-    }
-  }, [chatMessages]);
+    if (messages.length > 0) scrollToBottom();
+  }, [messages, scrollToBottom]);
+
+  // 工具调用处理
+  const handleToolCall = useCallback(
+    (toolCall: ToolCall): Promise<string> => {
+      return new Promise((resolve) => {
+        const needsConfirm = toolRequiresConfirmation(toolCall.toolName, toolsConfig);
+        if (!needsConfirm) {
+          const startMs = Date.now();
+          executeTool(toolCall.toolName, toolCall.toolCategory, toolCall.parameters, toolsConfig)
+            .then((result) => {
+              const log: ToolLog = {
+                id: `log_${Date.now()}`,
+                timestamp: Date.now(),
+                toolName: toolCall.toolName,
+                toolCategory: toolCall.toolCategory,
+                parameters: toolCall.parameters,
+                result,
+                userConfirmed: false,
+                executionTimeMs: Date.now() - startMs,
+              };
+              addLog(log);
+              resolve(result.success ? JSON.stringify(result.data) : `错误: ${result.error}`);
+            })
+            .catch((err: Error) => resolve(`执行失败: ${err.message}`));
+        } else {
+          setPendingToolCall(toolCall);
+          setResolveToolCall(() => resolve);
+        }
+      });
+    },
+    [toolsConfig, addLog]
+  );
+
+  const handleConfirmTool = useCallback(async () => {
+    if (!pendingToolCall || !resolveToolCall) return;
+    setPendingToolCall(null);
+    const startMs = Date.now();
+    const result = await executeTool(
+      pendingToolCall.toolName,
+      pendingToolCall.toolCategory,
+      pendingToolCall.parameters,
+      toolsConfig
+    );
+    const log: ToolLog = {
+      id: `log_${Date.now()}`,
+      timestamp: Date.now(),
+      toolName: pendingToolCall.toolName,
+      toolCategory: pendingToolCall.toolCategory,
+      parameters: pendingToolCall.parameters,
+      result,
+      userConfirmed: true,
+      executionTimeMs: Date.now() - startMs,
+    };
+    addLog(log);
+    resolveToolCall(result.success ? JSON.stringify(result.data) : `错误: ${result.error}`);
+    setResolveToolCall(null);
+  }, [pendingToolCall, resolveToolCall, toolsConfig, addLog]);
+
+  const handleCancelTool = useCallback(() => {
+    if (!pendingToolCall || !resolveToolCall) return;
+    setPendingToolCall(null);
+    resolveToolCall('用户取消了此操作');
+    setResolveToolCall(null);
+  }, [pendingToolCall, resolveToolCall]);
 
   // 发送消息
-  const handleSendMessage = () => {
-    if (!messageText.trim()) return;
-    if (!currentModel) {
-      alert('Please select a model first');
+  const handleSend = useCallback(async () => {
+    const text = inputText.trim();
+    if (!text || isGenerating) return;
+
+    if (!activeModel?.isLoaded) {
+      Alert.alert(
+        '未加载模型',
+        '请先在"模型"页面加载一个 GGUF 模型',
+        [{ text: '去加载', onPress: () => router.push('/(tabs)/models') }, { text: '取消' }]
+      );
       return;
     }
 
-    const userMessage = {
+    setInputText('');
+    setGenerating(true);
+    setError(null);
+
+    const userMsg: ChatMessage = {
       id: `msg_${Date.now()}`,
-      role: 'user' as const,
-      content: messageText.trim(),
+      role: 'user',
+      content: text,
       timestamp: Date.now(),
     };
+    addMessage(userMsg);
 
-    addChatMessage(userMessage);
-    setMessageText('');
+    const assistantMsgId = `msg_${Date.now() + 1}`;
+    const assistantMsg: ChatMessage = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+    addMessage(assistantMsg);
 
-    // TODO: 调用推理引擎
-    // 这里将集成实际的 llama.cpp 推理
-  };
-
-  // 导入模型
-  const handleImportModel = async () => {
     try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: 'application/*',
-      });
+      const finalText = await runInference(
+        text,
+        messages,
+        toolsConfig,
+        inferenceParams,
+        (token) => {
+          updateMessage(assistantMsgId, {
+            content: (messages.find((m) => m.id === assistantMsgId)?.content ?? '') + token,
+          });
+        },
+        handleToolCall
+      );
 
-      if (!result.canceled && result.assets && result.assets.length > 0) {
-        router.push({
-          pathname: '/(tabs)/models',
-          params: { importPath: result.assets[0].uri },
-        });
-      }
-    } catch (error) {
-      console.error('Failed to pick document:', error);
+      updateMessage(assistantMsgId, { content: finalText, isStreaming: false });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : '推理失败';
+      updateMessage(assistantMsgId, { content: `❌ ${errMsg}`, isStreaming: false });
+      setError(errMsg);
+    } finally {
+      setGenerating(false);
     }
-  };
+  }, [
+    inputText,
+    isGenerating,
+    activeModel,
+    messages,
+    toolsConfig,
+    inferenceParams,
+    addMessage,
+    updateMessage,
+    addLog,
+    setGenerating,
+    setError,
+    handleToolCall,
+  ]);
 
-  // 打开工具设置
-  const handleOpenToolSettings = () => {
-    router.push('/tools-settings');
-  };
+  const handleClearChat = useCallback(() => {
+    Alert.alert('清空对话', '确定要清空所有对话记录吗？', [
+      { text: '取消', style: 'cancel' },
+      { text: '清空', style: 'destructive', onPress: () => useAppStore.getState().clearMessages() },
+    ]);
+  }, []);
 
-  // 打开日志
-  const handleOpenLogs = () => {
-    router.push('/logs');
-  };
-
-  // 打开模型管理
-  const handleOpenModels = () => {
-    router.push('/models');
-  };
+  const renderMessage = useCallback(
+    ({ item }: { item: ChatMessage }) => {
+      const isUser = item.role === 'user';
+      return (
+        <View
+          style={[styles.msgRow, isUser ? styles.msgRowUser : styles.msgRowAssistant]}
+          accessible
+          accessibilityLabel={`${isUser ? '您' : 'AI'}：${item.content}`}
+          accessibilityRole="text"
+        >
+          <View
+            style={[
+              styles.msgBubble,
+              {
+                backgroundColor: isUser ? colors.primary : colors.surface,
+                borderColor: isUser ? colors.primary : colors.border,
+              },
+            ]}
+          >
+            {item.isStreaming && !item.content ? (
+              <View style={styles.typingIndicator}>
+                <ActivityIndicator size="small" color={colors.muted} />
+                <Text style={[styles.typingText, { color: colors.muted }]}>正在思考...</Text>
+              </View>
+            ) : (
+              <Text
+                style={[
+                  styles.msgText,
+                  { color: isUser ? '#fff' : colors.foreground },
+                ]}
+                selectable
+              >
+                {item.content}
+                {item.isStreaming ? '▌' : ''}
+              </Text>
+            )}
+          </View>
+          <Text style={[styles.msgTime, { color: colors.muted }]}>
+            {new Date(item.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+          </Text>
+        </View>
+      );
+    },
+    [colors]
+  );
 
   return (
-    <ScreenContainer className="flex-1 bg-background" edges={['top', 'left', 'right']}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        className="flex-1"
-      >
-        {/* 顶部控制栏 */}
-        <View
-          className="bg-surface border-b border-border px-4 py-3"
-          accessible={true}
-          accessibilityRole="toolbar"
-          accessibilityLabel="Chat controls toolbar"
+    <ScreenContainer>
+      {/* Header */}
+      <View style={[styles.header, { borderBottomColor: colors.border, backgroundColor: colors.surface }]}>
+        <TouchableOpacity
+          style={[styles.modelChip, { backgroundColor: colors.background, borderColor: colors.border }]}
+          onPress={() => router.push('/(tabs)/models')}
+          accessible
+          accessibilityRole="button"
+          accessibilityLabel={`当前模型：${activeModel ? activeModel.name : '未加载模型'}，双击切换`}
         >
-          {/* 模型选择 */}
-          <TouchableOpacity
-            onPress={handleOpenModels}
-            className="mb-3 p-2 bg-background rounded-lg border border-border"
-            accessible={true}
-            accessibilityRole="button"
-            accessibilityLabel={`Current model: ${currentModel?.name || 'No model selected'}`}
-            accessibilityHint="Tap to select or import a model"
-          >
-            <Text className="text-sm font-semibold text-foreground">
-              📦 {currentModel?.name || 'No Model'}
-            </Text>
-          </TouchableOpacity>
+          <Text style={[styles.modelDot, { color: activeModel?.isLoaded ? colors.success : colors.muted }]}>
+            {activeModel?.isLoaded ? '●' : '○'}
+          </Text>
+          <Text style={[styles.modelChipText, { color: colors.foreground }]} numberOfLines={1}>
+            {activeModel ? activeModel.name : '点击加载模型'}
+          </Text>
+        </TouchableOpacity>
 
-          {/* 工具开关 */}
-          <View className="flex-row gap-2 mb-3">
-            <TouchableOpacity
-              onPress={handleOpenToolSettings}
-              className={`flex-1 p-2 rounded-lg border ${
-                toolsConfig.WebSearch.enabled
-                  ? 'bg-primary border-primary'
-                  : 'bg-background border-border'
-              }`}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel={`Web Search: ${toolsConfig.WebSearch.enabled ? 'enabled' : 'disabled'}`}
-              accessibilityHint="Tap to toggle web search tool"
-            >
-              <Text
-                className={`text-center text-xs font-semibold ${
-                  toolsConfig.WebSearch.enabled ? 'text-background' : 'text-foreground'
-                }`}
-              >
-                🔍 Search
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              onPress={handleOpenToolSettings}
-              className={`flex-1 p-2 rounded-lg border ${
-                toolsConfig.Files.enabled
-                  ? 'bg-primary border-primary'
-                  : 'bg-background border-border'
-              }`}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel={`Files: ${toolsConfig.Files.enabled ? 'enabled' : 'disabled'}`}
-              accessibilityHint="Tap to toggle files tool"
-            >
-              <Text
-                className={`text-center text-xs font-semibold ${
-                  toolsConfig.Files.enabled ? 'text-background' : 'text-foreground'
-                }`}
-              >
-                📁 Files
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              onPress={handleOpenToolSettings}
-              className={`flex-1 p-2 rounded-lg border ${
-                toolsConfig.Media.enabled
-                  ? 'bg-primary border-primary'
-                  : 'bg-background border-border'
-              }`}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel={`Media: ${toolsConfig.Media.enabled ? 'enabled' : 'disabled'}`}
-              accessibilityHint="Tap to toggle media tool"
-            >
-              <Text
-                className={`text-center text-xs font-semibold ${
-                  toolsConfig.Media.enabled ? 'text-background' : 'text-foreground'
-                }`}
-              >
-                🎬 Media
-              </Text>
-            </TouchableOpacity>
+        <View style={styles.headerRight}>
+          <View style={styles.toolChips}>
+            {(
+              [
+                { key: 'WebSearch', label: '搜', icon: '🔍' },
+                { key: 'Files', label: '文', icon: '📁' },
+                { key: 'Media', label: '媒', icon: '🎬' },
+              ] as const
+            ).map(({ key, label, icon }) => {
+              const enabled = toolsConfig[key].enabled;
+              return (
+                <TouchableOpacity
+                  key={key}
+                  style={[
+                    styles.toolChip,
+                    {
+                      backgroundColor: enabled ? colors.primary + '22' : colors.surface,
+                      borderColor: enabled ? colors.primary : colors.border,
+                    },
+                  ]}
+                  onPress={() => router.push('/(tabs)/tools-settings')}
+                  accessible
+                  accessibilityRole="button"
+                  accessibilityLabel={`${label}工具${enabled ? '已启用' : '已禁用'}，双击进入工具设置`}
+                >
+                  <Text style={[styles.toolChipText, { color: enabled ? colors.primary : colors.muted }]}>
+                    {icon}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
           </View>
 
-          {/* 日志按钮 */}
-          <TouchableOpacity
-            onPress={handleOpenLogs}
-            className="p-2 bg-background rounded-lg border border-border"
-            accessible={true}
-            accessibilityRole="button"
-            accessibilityLabel="View tool logs"
-            accessibilityHint="Tap to view recent tool execution logs"
-          >
-            <Text className="text-sm font-semibold text-foreground">📋 Logs</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* 聊天消息列表 */}
-        <ScrollView
-          ref={scrollViewRef}
-          className="flex-1 bg-background"
-          contentContainerStyle={{ flexGrow: 1 }}
-          accessible={true}
-          accessibilityRole="list"
-          accessibilityLabel="Chat messages"
-        >
-          {chatMessages.length === 0 ? (
-            <View className="flex-1 items-center justify-center px-4">
-              <Text className="text-center text-lg font-semibold text-foreground mb-2">
-                Welcome to Offline AI Assistant
-              </Text>
-              <Text className="text-center text-sm text-muted mb-4">
-                Select a model and start chatting. Your AI runs locally on your device.
-              </Text>
-              <TouchableOpacity
-                onPress={handleImportModel}
-                className="bg-primary px-6 py-3 rounded-lg"
-                accessible={true}
-                accessibilityRole="button"
-                accessibilityLabel="Import model"
-              >
-                <Text className="text-background font-semibold">📥 Import Model</Text>
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <View className="py-4">
-              {chatMessages.map((message) => (
-                <ChatMessage key={message.id} message={message} />
-              ))}
-              {isInferencing && (
-                <View className="px-4 py-3 items-start">
-                  <View className="flex-row items-center gap-2">
-                    <ActivityIndicator size="small" color={colors.primary} />
-                    <Text className="text-sm text-muted">AI is thinking...</Text>
-                  </View>
-                </View>
-              )}
-            </View>
+          {messages.length > 0 && (
+            <TouchableOpacity
+              style={[styles.clearBtn, { borderColor: colors.border }]}
+              onPress={handleClearChat}
+              accessible
+              accessibilityRole="button"
+              accessibilityLabel="清空对话记录"
+            >
+              <Text style={[styles.clearBtnText, { color: colors.muted }]}>清空</Text>
+            </TouchableOpacity>
           )}
-        </ScrollView>
+        </View>
+      </View>
 
-        {/* 消息输入框 */}
-        <View
-          className="bg-surface border-t border-border px-4 py-3 gap-2"
-          accessible={true}
-          accessibilityRole="toolbar"
-          accessibilityLabel="Message input area"
-        >
-          <View className="flex-row gap-2 items-end">
-            <TextInput
-              value={messageText}
-              onChangeText={setMessageText}
-              placeholder="Type your message..."
-              placeholderTextColor={colors.muted}
-              className="flex-1 bg-background border border-border rounded-lg px-4 py-2 text-foreground"
-              multiline
-              maxLength={1000}
-              editable={!isInferencing && !!currentModel}
-              accessible={true}
-              accessibilityRole="search"
-              accessibilityLabel="Message input"
-              accessibilityHint="Enter your message to chat with the AI"
-            />
-            <TouchableOpacity
-              onPress={handleSendMessage}
-              disabled={isInferencing || !currentModel || !messageText.trim()}
-              className={`bg-primary px-4 py-2 rounded-lg ${
-                isInferencing || !currentModel || !messageText.trim() ? 'opacity-50' : ''
-              }`}
-              accessible={true}
-              accessibilityRole="button"
-              accessibilityLabel="Send message"
-              accessibilityHint="Send the message to the AI"
-            >
-              <Text className="text-background font-semibold">Send</Text>
-            </TouchableOpacity>
+      {/* Messages */}
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
+      >
+        {messages.length === 0 ? (
+          <View style={styles.emptyState} accessible accessibilityLabel="欢迎使用离线 AI 助手，请先加载模型后开始对话">
+            <Text style={[styles.emptyTitle, { color: colors.foreground }]}>离线 AI 助手</Text>
+            <Text style={[styles.emptyDesc, { color: colors.muted }]}>
+              所有推理在本地设备运行，无需网络。{'\n'}
+              支持文件管理、多媒体处理和网络搜索工具。{'\n'}
+              工具调用格式已针对小模型优化。
+            </Text>
+            {!activeModel?.isLoaded && (
+              <TouchableOpacity
+                style={[styles.loadModelBtn, { backgroundColor: colors.primary }]}
+                onPress={() => router.push('/(tabs)/models')}
+                accessible
+                accessibilityRole="button"
+                accessibilityLabel="前往加载模型"
+              >
+                <Text style={styles.loadModelBtnText}>📦 加载模型</Text>
+              </TouchableOpacity>
+            )}
           </View>
+        ) : (
+          <FlatList
+            ref={flatListRef}
+            data={messages}
+            keyExtractor={(item) => item.id}
+            renderItem={renderMessage}
+            contentContainerStyle={styles.messageList}
+            onContentSizeChange={scrollToBottom}
+            accessible={false}
+          />
+        )}
+
+        {/* Input */}
+        <View style={[styles.inputBar, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
+          <TextInput
+            style={[
+              styles.textInput,
+              {
+                backgroundColor: colors.background,
+                borderColor: colors.border,
+                color: colors.foreground,
+              },
+            ]}
+            value={inputText}
+            onChangeText={setInputText}
+            placeholder={activeModel?.isLoaded ? '输入消息...' : '请先加载模型'}
+            placeholderTextColor={colors.muted}
+            multiline
+            maxLength={4000}
+            editable={!isGenerating && !!activeModel?.isLoaded}
+            returnKeyType="default"
+            accessible
+            accessibilityRole="none"
+            accessibilityLabel="消息输入框"
+            accessibilityHint={activeModel?.isLoaded ? '输入您的消息，然后点击发送' : '请先在模型页面加载一个 GGUF 模型'}
+          />
+          <TouchableOpacity
+            style={[
+              styles.sendBtn,
+              {
+                backgroundColor:
+                  isGenerating || !activeModel?.isLoaded || !inputText.trim()
+                    ? colors.border
+                    : colors.primary,
+              },
+            ]}
+            onPress={handleSend}
+            disabled={isGenerating || !activeModel?.isLoaded || !inputText.trim()}
+            accessible
+            accessibilityRole="button"
+            accessibilityLabel={isGenerating ? '正在生成回复，请稍候' : '发送消息'}
+            accessibilityHint="双击发送消息"
+          >
+            {isGenerating ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Text style={styles.sendBtnText}>发送</Text>
+            )}
+          </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
 
-      {/* 工具确认弹窗 */}
+      {/* Tool Confirmation Modal */}
       <ToolConfirmationModal
-        visible={showToolConfirmation}
-        toolCall={selectedToolCall}
-        onConfirm={() => {
-          // TODO: 执行工具
-          setShowToolConfirmation(false);
-        }}
-        onCancel={() => {
-          setShowToolConfirmation(false);
-        }}
+        visible={!!pendingToolCall}
+        toolCall={pendingToolCall}
+        onConfirm={handleConfirmTool}
+        onCancel={handleCancelTool}
       />
     </ScreenContainer>
   );
 }
+
+const styles = StyleSheet.create({
+  flex: { flex: 1 },
+  header: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    gap: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+  },
+  modelChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    borderWidth: 1,
+    gap: 4,
+    maxWidth: '55%',
+  },
+  modelDot: { fontSize: 12 },
+  modelChipText: { fontSize: 13, fontWeight: '500', flexShrink: 1 },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  toolChips: { flexDirection: 'row', gap: 4 },
+  toolChip: {
+    width: 32,
+    height: 32,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toolChipText: { fontSize: 14 },
+  clearBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  clearBtnText: { fontSize: 12, fontWeight: '500' },
+  messageList: { padding: 12, gap: 8, paddingBottom: 16 },
+  msgRow: { marginBottom: 4 },
+  msgRowUser: { alignItems: 'flex-end' },
+  msgRowAssistant: { alignItems: 'flex-start' },
+  msgBubble: {
+    maxWidth: '85%',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 16,
+    borderWidth: 1,
+    minHeight: 40,
+    justifyContent: 'center',
+  },
+  msgText: { fontSize: 15, lineHeight: 22 },
+  msgTime: { fontSize: 11, marginTop: 3, marginHorizontal: 4 },
+  typingIndicator: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  typingText: { fontSize: 13 },
+  emptyState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+    gap: 16,
+  },
+  emptyTitle: { fontSize: 24, fontWeight: '700' },
+  emptyDesc: { fontSize: 14, lineHeight: 22, textAlign: 'center' },
+  loadModelBtn: {
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 24,
+    marginTop: 8,
+  },
+  loadModelBtnText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  inputBar: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    gap: 8,
+  },
+  textInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 15,
+    lineHeight: 22,
+    maxHeight: 120,
+    minHeight: 44,
+  },
+  sendBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+});
