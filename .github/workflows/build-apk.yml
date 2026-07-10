@@ -10,11 +10,14 @@ on:
         required: false
         default: '1.0.0'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       # ── Checkout ──────────────────────────────────────────────────────────────
@@ -28,47 +31,33 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # ── pnpm (must come before setup-node to avoid version conflict) ──────────
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
       # ── Node ──────────────────────────────────────────────────────────────────
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'pnpm'
 
-      # ── pnpm ──────────────────────────────────────────────────────────────────
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
-
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        shell: bash
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
-
-      - name: Cache pnpm modules
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
+      # ── Dependencies ──────────────────────────────────────────────────────────
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # ── Expo Prebuild ─────────────────────────────────────────────────────────
-      - name: Cache Expo prebuild
+      # ── Gradle cache ─────────────────────────────────────────────────────────
+      - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
-            android/.gradle
             ~/.gradle/caches
             ~/.gradle/wrapper
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      # ── Expo Prebuild ─────────────────────────────────────────────────────────
       - name: Expo prebuild (Android)
         run: |
           npx expo prebuild --platform android --clean --no-install
@@ -79,16 +68,19 @@ jobs:
       - name: Decode and place keystore
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/offline-ai-assistant.keystore
-          echo "Keystore placed at android/app/offline-ai-assistant.keystore"
           ls -lh android/app/offline-ai-assistant.keystore
 
       # ── Signing config ────────────────────────────────────────────────────────
       - name: Configure signing in build.gradle
         run: |
-          cat >> android/app/build.gradle << 'GRADLE_EOF'
+          # Inject signing config into android/app/build.gradle
+          python3 - << 'PYEOF'
+          import re
 
-          // Injected by CI: release signing config
-          android {
+          with open('android/app/build.gradle', 'r') as f:
+              content = f.read()
+
+          signing_config = """
               signingConfigs {
                   release {
                       storeFile file("offline-ai-assistant.keystore")
@@ -97,15 +89,25 @@ jobs:
                       keyPassword System.getenv("ANDROID_KEY_PASSWORD")
                   }
               }
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                      minifyEnabled false
-                      shrinkResources false
-                  }
-              }
-          }
-          GRADLE_EOF
+          """
+
+          # Insert signingConfigs before buildTypes
+          if 'signingConfigs' not in content:
+              content = content.replace('    buildTypes {', signing_config + '    buildTypes {')
+
+          # Set release buildType to use release signingConfig
+          content = re.sub(
+              r'(buildTypes\s*\{[^}]*release\s*\{)',
+              r'\1\n            signingConfig signingConfigs.release',
+              content,
+              count=1
+          )
+
+          with open('android/app/build.gradle', 'w') as f:
+              f.write(content)
+
+          print("Signing config injected successfully")
+          PYEOF
 
       # ── Build APK ─────────────────────────────────────────────────────────────
       - name: Build release APK
@@ -114,10 +116,9 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleRelease \
             --no-daemon \
-            --stacktrace \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m" \
-            -Dorg.gradle.parallel=false \
-            -Dorg.gradle.configureondemand=false
+            -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g" \
+            -Dorg.gradle.parallel=true \
+            -Dorg.gradle.caching=true
         env:
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -129,14 +130,12 @@ jobs:
           VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
           BUILD_NUM="${{ github.run_number }}"
           APK_NAME="OfflineAIAssistant-v${VERSION}-build${BUILD_NUM}.apk"
-          
-          find android -name "*.apk" -not -path "*/intermediates/*" | head -5
-          
+
           APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
           if [ -z "$APK_SRC" ]; then
             APK_SRC=$(find android -name "*.apk" -not -path "*/intermediates/*" | head -1)
           fi
-          
+
           echo "Source APK: $APK_SRC"
           mkdir -p dist
           cp "$APK_SRC" "dist/$APK_NAME"
@@ -162,15 +161,14 @@ jobs:
             ## Offline AI Assistant APK
 
             **版本**: v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})
-            **构建时间**: ${{ github.event.head_commit.timestamp }}
 
             ### 功能
-            - 本地离线 AI 推理（llama.rn + llama.cpp 最新版）
+            - 本地离线 AI 推理（llama.rn + llama.cpp 最新版 b9888）
             - 聊天界面（流式输出）
             - GGUF 模型管理（导入/加载/卸载/删除）
             - 文件管理工具（ls/cat/write/mkdir/rm/mv/zip）
             - 多媒体处理工具（media_info/media_proc）
-            - 网络搜索工具（DuckDuckGo/百度/夸克）
+            - 网络搜索工具（Tavily AI / Exa AI / DuckDuckGo / 百度）
             - 推理参数设置（上下文长度/温度/重复惩罚等）
             - 完整无障碍支持（TalkBack）
             - 工具调用日志系统
@@ -192,8 +190,5 @@ jobs:
       - name: Build Summary
         run: |
           echo "## ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**APK**: \`${{ env.APK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Size**: $(ls -lh ${{ env.APK_PATH }} | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download from the [Releases page](https://github.com/zhangzheyuanviolin-ship-it/offline-ai-assistant-android/releases)" >> $GITHUB_STEP_SUMMARY
+          echo "Download from [Releases](https://github.com/zhangzheyuanviolin-ship-it/offline-ai-assistant-android/releases)" >> $GITHUB_STEP_SUMMARY
