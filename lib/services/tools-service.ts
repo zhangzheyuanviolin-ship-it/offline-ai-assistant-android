@@ -6,12 +6,13 @@
  * 2. 工具数量精简：合并相似功能，减少模型选择难度
  * 3. 系统提示极简：工具描述控制在 200 token 以内
  * 4. 参数名极短：path→p, content→c, query→q 等
+ * 5. 工作区隔离：所有 Files/Media 操作限制在 workspaceDir 内，防止越权
  *
  * 搜索引擎：
  * - tavily: Tavily AI Search（专为 AI 优化，返回结构化摘要，需 API Key）
  * - exa: Exa AI Search（语义向量搜索，需 API Key）
  * - duckduckgo: DuckDuckGo HTML 抓取（无需 API Key）
- * - baidu: 百度搜索 HTML 抓取（无需 API Key）
+ * - baidu: 百度搜索 HTML 抓取（无需 API Key，移动端 URL + 宽松匹配）
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -28,18 +29,18 @@ export interface ToolDef {
 }
 
 const FILE_TOOLS: ToolDef[] = [
-  { name: 'ls',    category: 'Files', desc: '列出目录内容',        params: { p: { t: 'str', d: '目录路径', req: true } }, dangerous: false },
-  { name: 'cat',   category: 'Files', desc: '读取文件内容',        params: { p: { t: 'str', d: '文件路径', req: true }, n: { t: 'int', d: '最大字节数' } }, dangerous: false },
-  { name: 'write', category: 'Files', desc: '写入文件',            params: { p: { t: 'str', d: '文件路径', req: true }, c: { t: 'str', d: '内容', req: true }, ow: { t: 'bool', d: '覆盖' } }, dangerous: true },
-  { name: 'mkdir', category: 'Files', desc: '创建目录',            params: { p: { t: 'str', d: '目录路径', req: true } }, dangerous: false },
-  { name: 'rm',    category: 'Files', desc: '删除文件或目录',      params: { p: { t: 'str', d: '路径', req: true } }, dangerous: true },
-  { name: 'mv',    category: 'Files', desc: '移动或重命名文件',    params: { src: { t: 'str', d: '源路径', req: true }, dst: { t: 'str', d: '目标路径', req: true } }, dangerous: true },
-  { name: 'zip',   category: 'Files', desc: '压缩/解压文件',       params: { p: { t: 'str', d: '输入路径', req: true }, o: { t: 'str', d: '输出路径', req: true }, mode: { t: 'str', d: 'zip或unzip', req: true } }, dangerous: false },
+  { name: 'ls',    category: 'Files', desc: '列出目录内容',        params: { p: { t: 'str', d: '相对工作区的目录路径', req: true } }, dangerous: false },
+  { name: 'cat',   category: 'Files', desc: '读取文件内容',        params: { p: { t: 'str', d: '相对工作区的文件路径', req: true }, n: { t: 'int', d: '最大字节数' } }, dangerous: false },
+  { name: 'write', category: 'Files', desc: '写入文件',            params: { p: { t: 'str', d: '相对工作区的文件路径', req: true }, c: { t: 'str', d: '内容', req: true }, ow: { t: 'bool', d: '覆盖' } }, dangerous: true },
+  { name: 'mkdir', category: 'Files', desc: '创建目录',            params: { p: { t: 'str', d: '相对工作区的目录路径', req: true } }, dangerous: false },
+  { name: 'rm',    category: 'Files', desc: '删除文件或目录',      params: { p: { t: 'str', d: '相对工作区的路径', req: true } }, dangerous: true },
+  { name: 'mv',    category: 'Files', desc: '移动或重命名文件',    params: { src: { t: 'str', d: '相对工作区的源路径', req: true }, dst: { t: 'str', d: '相对工作区的目标路径', req: true } }, dangerous: true },
+  { name: 'zip',   category: 'Files', desc: '压缩/解压文件',       params: { p: { t: 'str', d: '相对工作区的输入路径', req: true }, o: { t: 'str', d: '相对工作区的输出路径', req: true }, mode: { t: 'str', d: 'zip或unzip', req: true } }, dangerous: false },
 ];
 
 const MEDIA_TOOLS: ToolDef[] = [
-  { name: 'media_info', category: 'Media', desc: '获取媒体文件信息',                           params: { p: { t: 'str', d: '媒体文件路径', req: true } }, dangerous: false },
-  { name: 'media_proc', category: 'Media', desc: '处理媒体(提取音频/转码/裁剪/合并)', params: { op: { t: 'str', d: 'extract_audio|transcode|trim|merge', req: true }, p: { t: 'str', d: '输入路径', req: true }, o: { t: 'str', d: '输出路径', req: true }, args: { t: 'obj', d: '额外参数' } }, dangerous: false },
+  { name: 'media_info', category: 'Media', desc: '获取媒体文件信息',                           params: { p: { t: 'str', d: '相对工作区的媒体文件路径', req: true } }, dangerous: false },
+  { name: 'media_proc', category: 'Media', desc: '处理媒体(提取音频/转码/裁剪/合并)', params: { op: { t: 'str', d: 'extract_audio|transcode|trim|merge', req: true }, p: { t: 'str', d: '相对工作区的输入路径', req: true }, o: { t: 'str', d: '相对工作区的输出路径', req: true }, args: { t: 'obj', d: '额外参数' } }, dangerous: false },
 ];
 
 const WEB_TOOLS: ToolDef[] = [
@@ -47,6 +48,47 @@ const WEB_TOOLS: ToolDef[] = [
 ];
 
 const ALL_TOOLS = [...FILE_TOOLS, ...MEDIA_TOOLS, ...WEB_TOOLS];
+
+// ─── Workspace Path Resolver ──────────────────────────────────────────────────
+
+/**
+ * 将模型给出的路径解析为绝对路径，并强制限制在 workspaceDir 之下。
+ * - 绝对路径（以 / 开头）：直接使用，但仍需校验是否在 workspaceDir 下
+ * - 相对路径：拼接 workspaceDir
+ * 解析后禁止越过 workspaceDir，防止模型逃逸到系统目录。
+ */
+function resolveSafePath(inputPath: string, workspaceDir: string): string {
+  let p = (inputPath || '').trim();
+  if (!p) throw new Error('路径不能为空');
+  if (p.startsWith('file://')) p = p.slice('file://'.length);
+
+  const base = workspaceDir.replace(/\/+$/, '');
+  let absolute: string;
+  if (p.startsWith('/')) {
+    absolute = p;
+  } else {
+    absolute = base + '/' + p;
+  }
+
+  // 规范化 .. 和 .
+  const segments: string[] = [];
+  for (const seg of absolute.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (segments.length === 0) {
+        throw new Error(`路径越权：禁止访问工作区之外的目录 (${inputPath})`);
+      }
+      segments.pop();
+    } else {
+      segments.push(seg);
+    }
+  }
+  const resolved = '/' + segments.join('/');
+  if (!resolved.startsWith(base + '/') && resolved !== base) {
+    throw new Error(`路径越权：禁止访问工作区之外的目录 (${inputPath})`);
+  }
+  return resolved;
+}
 
 // ─── System Prompt Builder ────────────────────────────────────────────────────
 
@@ -140,12 +182,16 @@ export function toolRequiresConfirmation(toolName: string, toolsConfig: ToolsCon
 
 // ─── File Tool Execution ──────────────────────────────────────────────────────
 
-async function execFileTool(name: string, p: Record<string, unknown>): Promise<ToolResult> {
+async function execFileTool(
+  name: string,
+  p: Record<string, unknown>,
+  workspaceDir: string
+): Promise<ToolResult> {
   const ts = Date.now();
   try {
     switch (name) {
       case 'ls': {
-        const path = p.p as string;
+        const path = resolveSafePath(p.p as string, workspaceDir);
         const files = await FileSystem.readDirectoryAsync(path);
         const details = await Promise.all(
           files.map(async (f) => {
@@ -153,29 +199,38 @@ async function execFileTool(name: string, p: Record<string, unknown>): Promise<T
             return { name: f, dir: info.isDirectory ?? false, size: (info as { size?: number }).size ?? 0 };
           })
         );
-        return { toolName: name, success: true, data: { files: details, count: files.length }, timestamp: ts };
+        return { toolName: name, success: true, data: { files: details, count: files.length, path }, timestamp: ts };
       }
       case 'cat': {
-        const content = await FileSystem.readAsStringAsync(p.p as string);
-        const maxBytes = (p.n as number) || 65536;
+        const path = resolveSafePath(p.p as string, workspaceDir);
+        const content = await FileSystem.readAsStringAsync(path);
+        const maxBytes = (p.n as number) || 32768;
         const truncated = content.length > maxBytes;
         return { toolName: name, success: true, data: { content: truncated ? content.substring(0, maxBytes) + '\n...[截断]' : content, truncated }, timestamp: ts };
       }
       case 'write': {
-        const info = await FileSystem.getInfoAsync(p.p as string);
+        const path = resolveSafePath(p.p as string, workspaceDir);
+        const info = await FileSystem.getInfoAsync(path);
         if (info.exists && !p.ow) throw new Error('文件已存在，设置 ow:true 以覆盖');
-        await FileSystem.writeAsStringAsync(p.p as string, p.c as string);
-        return { toolName: name, success: true, data: { path: p.p, bytes: (p.c as string).length }, timestamp: ts };
+        await FileSystem.writeAsStringAsync(path, p.c as string);
+        return { toolName: name, success: true, data: { path, bytes: (p.c as string).length }, timestamp: ts };
       }
-      case 'mkdir':
-        await FileSystem.makeDirectoryAsync(p.p as string, { intermediates: true });
-        return { toolName: name, success: true, data: { path: p.p }, timestamp: ts };
-      case 'rm':
-        await FileSystem.deleteAsync(p.p as string, { idempotent: true });
-        return { toolName: name, success: true, data: { path: p.p }, timestamp: ts };
-      case 'mv':
-        await FileSystem.moveAsync({ from: p.src as string, to: p.dst as string });
-        return { toolName: name, success: true, data: { src: p.src, dst: p.dst }, timestamp: ts };
+      case 'mkdir': {
+        const path = resolveSafePath(p.p as string, workspaceDir);
+        await FileSystem.makeDirectoryAsync(path, { intermediates: true });
+        return { toolName: name, success: true, data: { path }, timestamp: ts };
+      }
+      case 'rm': {
+        const path = resolveSafePath(p.p as string, workspaceDir);
+        await FileSystem.deleteAsync(path, { idempotent: true });
+        return { toolName: name, success: true, data: { path }, timestamp: ts };
+      }
+      case 'mv': {
+        const src = resolveSafePath(p.src as string, workspaceDir);
+        const dst = resolveSafePath(p.dst as string, workspaceDir);
+        await FileSystem.moveAsync({ from: src, to: dst });
+        return { toolName: name, success: true, data: { src, dst }, timestamp: ts };
+      }
       case 'zip':
         return { toolName: name, success: false, error: `${p.mode} 功能需要 react-native-zip-archive（待集成）`, timestamp: ts };
       default:
@@ -188,17 +243,34 @@ async function execFileTool(name: string, p: Record<string, unknown>): Promise<T
 
 // ─── Media Tool Execution ─────────────────────────────────────────────────────
 
-async function execMediaTool(name: string, p: Record<string, unknown>): Promise<ToolResult> {
+async function execMediaTool(
+  name: string,
+  p: Record<string, unknown>,
+  workspaceDir: string
+): Promise<ToolResult> {
   const ts = Date.now();
   if (name === 'media_info') {
     try {
-      const info = await FileSystem.getInfoAsync(p.p as string);
-      return { toolName: name, success: true, data: { path: p.p, exists: info.exists, size: (info as { size?: number }).size ?? 0, isDir: info.isDirectory }, timestamp: ts };
+      const path = resolveSafePath(p.p as string, workspaceDir);
+      const info = await FileSystem.getInfoAsync(path);
+      return { toolName: name, success: true, data: { path, exists: info.exists, size: (info as { size?: number }).size ?? 0, isDir: info.isDirectory }, timestamp: ts };
     } catch (e) {
       return { toolName: name, success: false, error: String(e), timestamp: ts };
     }
   }
-  return { toolName: name, success: false, error: `媒体处理需要 FFmpegKit 支持，当前版本暂不支持 ${p.op ?? name} 操作`, timestamp: ts };
+  // media_proc：当前版本仅做路径校验，真正的转码/裁剪需要 FFmpegKit。
+  try {
+    const path = resolveSafePath(p.p as string, workspaceDir);
+    const out = p.o ? resolveSafePath(p.o as string, workspaceDir) : '';
+    return {
+      toolName: name,
+      success: false,
+      error: `媒体处理 (${p.op ?? name}) 需要 FFmpegKit 支持，当前版本暂未集成。已解析输入路径：${path}${out ? '，输出：' + out : ''}`,
+      timestamp: ts,
+    };
+  } catch (e) {
+    return { toolName: name, success: false, error: String(e), timestamp: ts };
+  }
 }
 
 // ─── Web Search Tool Execution ────────────────────────────────────────────────
@@ -278,6 +350,7 @@ async function searchExa(
 
 /**
  * DuckDuckGo HTML 抓取（无需 API Key）
+ * 使用 html.duckduckgo.com（lite 版），正则更宽松以提高命中率。
  */
 async function searchDuckDuckGo(
   query: string,
@@ -285,15 +358,29 @@ async function searchDuckDuckGo(
 ): Promise<Array<{ title: string; url: string; content: string }>> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Android 14; Mobile) AppleWebKit/537.36' },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
   });
   const html = await resp.text();
   const results: Array<{ title: string; url: string; content: string }> = [];
-  const re = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]{10,})<\/a>/gi;
+  // DDG HTML 的结果在 result__a / result__url 结构中，但为了健壮，匹配所有外链 <a>
+  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = re.exec(html)) !== null && results.length < maxResults) {
-    if (!m[1].includes('duckduckgo')) {
-      results.push({ title: m[2].trim(), url: m[1], content: '' });
+    const link = m[1];
+    const title = m[2].replace(/<[^>]+>/g, '').trim();
+    if (!link.includes('duckduckgo.com') && title.length >= 4) {
+      results.push({ title: title.substring(0, 120), url: link, content: '' });
+    }
+  }
+  // Fallback：宽松匹配
+  if (results.length === 0) {
+    const re2 = /<a[^>]+href="(https?:\/\/(?!duckduckgo)[^"]+)"[^>]*>([^<]{6,})<\/a>/gi;
+    while ((m = re2.exec(html)) !== null && results.length < maxResults) {
+      results.push({ title: m[2].trim().substring(0, 120), url: m[1], content: '' });
     }
   }
   return results;
@@ -301,23 +388,38 @@ async function searchDuckDuckGo(
 
 /**
  * 百度搜索 HTML 抓取（无需 API Key）
+ * 使用移动端 m.baidu.com，结果结构稳定可解析。
+ * 解析失败时自动 fallback 到 DuckDuckGo，确保模型一定能拿到结果。
  */
 async function searchBaidu(
   query: string,
   maxResults: number
 ): Promise<Array<{ title: string; url: string; content: string }>> {
-  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
+  const url = `https://m.baidu.com/s?wd=${encodeURIComponent(query)}`;
   const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Android 14; Mobile) AppleWebKit/537.36' },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+    },
   });
   const html = await resp.text();
   const results: Array<{ title: string; url: string; content: string }> = [];
-  const re = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]{10,})<\/a>/gi;
+
+  // 百度移动端的结果 a 标签通常带 data-tools 或 class="c-show-url"
+  const re = /<a[^>]+href="([^"]+)"[^>]*>([^<]{4,})<\/a>/gi;
   let m;
+  const seen = new Set<string>();
   while ((m = re.exec(html)) !== null && results.length < maxResults) {
-    if (!m[1].includes('baidu')) {
-      results.push({ title: m[2].trim(), url: m[1], content: '' });
-    }
+    let link = m[1];
+    const title = m[2].trim();
+    // 跳过百度内部链接与空标题
+    if (!title) continue;
+    if (link.includes('baidu.com') || link.startsWith('javascript:')) continue;
+    if (link.startsWith('//')) link = 'https:' + link;
+    if (seen.has(link)) continue;
+    seen.add(link);
+    results.push({ title: title.substring(0, 120), url: link, content: '' });
   }
   return results;
 }
@@ -332,25 +434,45 @@ async function execWebSearchTool(
 
   const query = p.q as string;
   const maxResults = Math.max(1, Math.min(20, (p.n as number) || toolsConfig.WebSearch.maxResults || 5));
-  const engine: SearchEngine = toolsConfig.WebSearch.engine;
+  let engine: SearchEngine = toolsConfig.WebSearch.engine;
 
   try {
     let rawResults: Array<{ title: string; url: string; content: string; score?: number }>;
 
-    switch (engine) {
-      case 'tavily':
-        rawResults = await searchTavily(query, maxResults, toolsConfig.WebSearch.tavilyApiKey);
-        break;
-      case 'exa':
-        rawResults = await searchExa(query, maxResults, toolsConfig.WebSearch.exaApiKey);
-        break;
-      case 'baidu':
-        rawResults = await searchBaidu(query, maxResults);
-        break;
-      case 'duckduckgo':
-      default:
+    try {
+      switch (engine) {
+        case 'tavily':
+          rawResults = await searchTavily(query, maxResults, toolsConfig.WebSearch.tavilyApiKey);
+          break;
+        case 'exa':
+          rawResults = await searchExa(query, maxResults, toolsConfig.WebSearch.exaApiKey);
+          break;
+        case 'baidu':
+          rawResults = await searchBaidu(query, maxResults);
+          // 百度解析失败（0 条）→ 自动 fallback 到 DuckDuckGo，确保模型有结果可用
+          if (rawResults.length === 0) {
+            rawResults = await searchDuckDuckGo(query, maxResults);
+            engine = 'duckduckgo';
+          }
+          break;
+        case 'duckduckgo':
+        default:
+          rawResults = await searchDuckDuckGo(query, maxResults);
+          // DDG 也失败 → 尝试百度
+          if (rawResults.length === 0) {
+            rawResults = await searchBaidu(query, maxResults);
+            if (rawResults.length > 0) engine = 'baidu';
+          }
+          break;
+      }
+    } catch (engineErr) {
+      // 当前引擎失败 → 自动 fallback 到 DuckDuckGo
+      if (engine !== 'duckduckgo') {
         rawResults = await searchDuckDuckGo(query, maxResults);
-        break;
+        engine = 'duckduckgo';
+      } else {
+        throw engineErr;
+      }
     }
 
     // 统一格式化结果（极简，节省 token）
@@ -360,6 +482,15 @@ async function execWebSearchTool(
       url: r.url,
       snippet: r.content ? r.content.substring(0, 200) : '',
     }));
+
+    if (results.length === 0) {
+      return {
+        toolName: name,
+        success: false,
+        error: `${engine} 搜索未返回结果，请尝试更换关键词或检查网络`,
+        timestamp: ts,
+      };
+    }
 
     return {
       toolName: name,
@@ -378,11 +509,12 @@ export async function executeTool(
   toolName: string,
   category: ToolCategory,
   parameters: Record<string, unknown>,
-  toolsConfig: ToolsConfig
+  toolsConfig: ToolsConfig,
+  workspaceDir: string
 ): Promise<ToolResult> {
   switch (category) {
-    case 'Files':   return execFileTool(toolName, parameters);
-    case 'Media':   return execMediaTool(toolName, parameters);
+    case 'Files':   return execFileTool(toolName, parameters, workspaceDir);
+    case 'Media':   return execMediaTool(toolName, parameters, workspaceDir);
     case 'WebSearch': return execWebSearchTool(toolName, parameters, toolsConfig);
     default:        return { toolName, success: false, error: `未知工具类别: ${category}`, timestamp: Date.now() };
   }
