@@ -35,11 +35,15 @@ interface AppStore extends AppState {
   addMessage: (message: ChatMessage) => void;
   updateMessage: (messageId: string, updates: Partial<ChatMessage>) => void;
   updateToolCall: (messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
+  removeMessage: (messageId: string) => void;
   clearMessages: () => void;
 
   // 工具日志
   addLog: (log: ToolLog) => void;
   clearLogs: () => void;
+
+  // 工作区
+  setWorkspaceDir: (dir: string) => void;
 
   // 推理状态
   setGenerating: (generating: boolean) => void;
@@ -58,6 +62,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   isGenerating: false,
   contextId: null,
   error: null,
+  // 默认工作区：FileSystem.documentDirectory + 'workspace/'
+  // 由调用方（ChatScreen / settings）在挂载时覆盖为真实绝对路径
+  workspaceDir: '',
 
   // ─── Model Management ─────────────────────────────────────────────────────
   addModel: (model) => {
@@ -92,11 +99,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   loadModelsFromStorage: async () => {
     try {
-      const [modelsJson, activeId, paramsJson, toolsJson] = await Promise.all([
+      const [modelsJson, activeId, paramsJson, toolsJson, wsJson] = await Promise.all([
         AsyncStorage.getItem('models'),
         AsyncStorage.getItem('activeModelId'),
         AsyncStorage.getItem('inferenceParams'),
         AsyncStorage.getItem('toolsConfig'),
+        AsyncStorage.getItem('workspaceDir'),
       ]);
       const models: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
       const inferenceParams = paramsJson
@@ -110,6 +118,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeModelId: activeId || null,
         inferenceParams,
         toolsConfig,
+        workspaceDir: wsJson || '',
       });
     } catch {
       // ignore storage errors
@@ -209,6 +218,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }));
   },
 
+  removeMessage: (messageId) => {
+    set((state) => ({ messages: state.messages.filter((m) => m.id !== messageId) }));
+  },
+
   clearMessages: () => set({ messages: [] }),
 
   // ─── Logs ─────────────────────────────────────────────────────────────────
@@ -220,6 +233,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   clearLogs: () => set({ logs: [] }),
+
+  // ─── Workspace ────────────────────────────────────────────────────────────
+  setWorkspaceDir: (dir) => {
+    set({ workspaceDir: dir });
+    AsyncStorage.setItem('workspaceDir', dir).catch(() => {});
+  },
 
   // ─── Inference State ──────────────────────────────────────────────────────
   setGenerating: (isGenerating) => set({ isGenerating }),
