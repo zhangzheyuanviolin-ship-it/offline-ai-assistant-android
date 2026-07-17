@@ -45,7 +45,8 @@ export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
   top_k: 40,
   repeat_penalty: 1.1,
   max_tokens: 2048,
-  stop: ['<|end|>', '</s>', '<|im_end|>', '<|eot_id|>'],
+  // 过滤掉空字符串，避免传给 llama.rn 时触发异常
+  stop: ['<|end|>', '</s>', '', '<|endoftext|>'],
 };
 
 // ─── Message Types ────────────────────────────────────────────────────────────
@@ -79,6 +80,10 @@ export interface ChatMessage {
   isStreaming?: boolean;
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  // 系统提示用：渲染时折叠显示
+  isActivity?: boolean;
+  // 活动类型：thinking | tool_calling | tool_done | warning
+  activityType?: 'thinking' | 'tool_calling' | 'tool_done' | 'warning' | 'error';
 }
 
 // ─── Tool Types ───────────────────────────────────────────────────────────────
@@ -120,7 +125,7 @@ export interface ToolsConfig {
 export const DEFAULT_TOOLS_CONFIG: ToolsConfig = {
   WebSearch: {
     enabled: true,
-    engine: 'tavily',
+    engine: 'duckduckgo',
     permissionLevel: 'ALLOW',
     tavilyApiKey: '',
     exaApiKey: '',
@@ -171,4 +176,6 @@ export interface AppState {
   isGenerating: boolean;
   contextId: string | null; // llama.rn context handle
   error: string | null;
+  // 智能体工作区：所有 Files/Media 工具的输入输出都限制在此目录及其子目录下
+  workspaceDir: string;
 }
