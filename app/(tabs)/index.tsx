@@ -33,19 +33,19 @@ import { router } from 'expo-router';
  * 工具调用格式：{"t":"工具名","p":{参数}}
  *
  * 关键修复：
- * - onToken 不再依赖闭包中的 messages；改为每次回调累加到 roundText 并通过
- *   onTokenRef.current 转发最新内容。UI 端用 RAF 节流，避免每个 token 都触发整棵
- *   消息树重渲染导致主线程雪崩崩溃。
+ * - 完全消除 stale closure：所有需要的初始参数在函数入口处一次性捕获
+ * - onToken 是直接引用 UI 维护的 ref.flush，不走 zustand setState（避免消息合并丢失）
+ * - 实时 activity 回调：让用户能看到 token 数 / 当前阶段
  */
 async function runInference(
   userText: string,
-  history: ChatMessage[],
+  historySnapshot: ChatMessage[],
   toolsConfig: ReturnType<typeof useAppStore.getState>['toolsConfig'],
   inferenceParams: ReturnType<typeof useAppStore.getState>['inferenceParams'],
   workspaceDir: string,
-  onToken: (token: string) => void,
+  pushToken: (token: string) => void,
   onToolCall: (call: ToolCall) => Promise<string>,
-  onActivity: (kind: 'thinking' | 'tool_calling' | 'tool_done' | 'warning' | 'error', text: string) => void
+  onActivity: (kind: 'thinking' | 'streaming' | 'tool_calling' | 'tool_done' | 'warning' | 'error', text: string) => void
 ): Promise<string> {
   const ctx = getActiveContext();
   if (!ctx) throw new Error('没有已加载的模型，请先在"模型"页面加载一个 GGUF 模型');
@@ -55,7 +55,7 @@ async function runInference(
   const systemContent = `你是一个离线 AI 助手，运行在用户手机上。简洁回答，必要时调用工具。${toolPrompt}`;
 
   // 仅保留最近 20 条历史节省上下文
-  const recentHistory = history
+  const recentHistory = historySnapshot
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-20);
 
@@ -65,16 +65,20 @@ async function runInference(
     { role: 'user', content: userText },
   ];
 
-  // 过滤空字符串 stop token（之前包含两个空串，可能导致 llama.rn 异常）
+  // 过滤空字符串 stop token
   const safeStop = (inferenceParams.stop || []).filter((s) => typeof s === 'string' && s.length > 0);
 
   let fullResponse = '';
   let toolCallRound = 0;
   const MAX_TOOL_ROUNDS = 3;
+  let tokenCount = 0;
 
   while (toolCallRound <= MAX_TOOL_ROUNDS) {
     let roundText = '';
 
+    onActivity('streaming', `已生成 0 个 token...`);
+
+    // eslint-disable-next-line no-await-in-loop
     await ctx.completion(
       {
         messages: msgs as Parameters<typeof ctx.completion>[0]['messages'],
@@ -88,10 +92,19 @@ async function runInference(
       (data: { token: string }) => {
         const tok = data.token ?? '';
         if (!tok) return;
-        roundText += tok;
+        // 过滤控制字符（thinking 标签、特殊符号），保留可显示 token
+        // llama.rn 可能输出  等，对小模型也常见
+        const visible = tok.replace(/<\|[^|]+?\|>/g, '');
+        if (visible.length === 0) return;
+        roundText += visible;
         if (toolCallRound === 0) {
-          fullResponse += tok;
-          onToken(tok);
+          fullResponse += visible;
+          tokenCount++;
+          // 每 8 个 token 更新一次 activity 提示（避免 activity 本身雪崩）
+          if (tokenCount % 8 === 0 || tokenCount === 1) {
+            onActivity('streaming', `已生成 ${tokenCount} 个 token...`);
+          }
+          pushToken(visible);
         }
       }
     );
@@ -120,6 +133,7 @@ async function runInference(
         status: 'pending',
       };
 
+      // eslint-disable-next-line no-await-in-loop
       const resultStr = await onToolCall(toolCall);
       toolResults.push(`[${tc.toolName}结果]: ${resultStr}`);
     }
@@ -131,75 +145,8 @@ async function runInference(
     msgs.push({ role: 'user', content: `工具执行完成：\n${toolResultContent}\n\n请根据以上结果继续回答。` });
   }
 
+  onActivity('streaming', `生成完成（${tokenCount} tokens）`);
   return fullResponse;
-}
-
-// ─── Streaming Buffer Hook (RAF-throttled) ────────────────────────────────────
-
-interface StreamBuffer {
-  /** 推入一个 token，立即累加但不立刻触发 UI 更新 */
-  push(token: string): void;
-  /** 强制 flush（推理结束时调用） */
-  flush(): void;
-  /** 取消（如出错时） */
-  cancel(): void;
-}
-
-/**
- * 创建流式输出缓冲：通过 requestAnimationFrame 将一帧内的多个 token 合并为一次
- * setState 调用。重渲染频率从"每个 token 一次"降到"每秒最多 60 次"。
- */
-function createStreamBuffer(
-  getCurrent: () => string,
-  applyUpdate: (newContent: string) => void
-): StreamBuffer {
-  let pending = '';
-  let rafHandle: number | null = null;
-
-  const flush = () => {
-    rafHandle = null;
-    if (pending.length > 0) {
-      const next = getCurrent() + pending;
-      pending = '';
-      applyUpdate(next);
-    }
-  };
-
-  return {
-    push(token: string) {
-      pending += token;
-      if (rafHandle == null) {
-        if (typeof requestAnimationFrame !== 'undefined') {
-          rafHandle = requestAnimationFrame(flush);
-        } else {
-          // Fallback: 16ms 定时器
-          rafHandle = setTimeout(flush, 16) as unknown as number;
-        }
-      }
-    },
-    flush() {
-      if (rafHandle != null) {
-        if (typeof cancelAnimationFrame !== 'undefined') {
-          cancelAnimationFrame(rafHandle);
-        } else {
-          clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
-        }
-        rafHandle = null;
-      }
-      flush();
-    },
-    cancel() {
-      if (rafHandle != null) {
-        if (typeof cancelAnimationFrame !== 'undefined') {
-          cancelAnimationFrame(rafHandle);
-        } else {
-          clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
-        }
-        rafHandle = null;
-      }
-      pending = '';
-    },
-  };
 }
 
 // ─── Activity Message (轻量提示行) ─────────────────────────────────────────────
@@ -214,12 +161,17 @@ const ActivityMessage = memo(function ActivityMessage({
   const icon =
     item.activityType === 'tool_calling' ? '🛠️' :
     item.activityType === 'tool_done' ? '✅' :
+    item.activityType === 'streaming' ? '✍️' :
     item.activityType === 'warning' ? '⚠️' :
     item.activityType === 'error' ? '❌' : '💭';
   return (
-    <View style={[styles.activityRow, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+    <View
+      style={[styles.activityRow, { backgroundColor: colors.surface, borderColor: colors.border }]}
+      accessible
+      accessibilityLabel={`系统提示：${item.content}`}
+    >
       <Text style={[styles.activityIcon]}>{icon}</Text>
-      <Text style={[styles.activityText, { color: colors.muted }]} numberOfLines={2}>
+      <Text style={[styles.activityText, { color: colors.muted }]} numberOfLines={3}>
         {item.content}
       </Text>
     </View>
@@ -236,11 +188,13 @@ const MessageItem = memo(function MessageItem({
   colors: ReturnType<typeof useColors>;
 }) {
   const isUser = item.role === 'user';
+  // 兜底：content 永远存在
+  const displayContent = item.content || '';
   return (
     <View
       style={[styles.msgRow, isUser ? styles.msgRowUser : styles.msgRowAssistant]}
       accessible
-      accessibilityLabel={`${isUser ? '您' : 'AI'}：${item.content}`}
+      accessibilityLabel={`${isUser ? '您' : 'AI'}：${displayContent}`}
       accessibilityRole="text"
     >
       <View
@@ -252,7 +206,7 @@ const MessageItem = memo(function MessageItem({
           },
         ]}
       >
-        {item.isStreaming && !item.content ? (
+        {item.isStreaming && !displayContent ? (
           <View style={styles.typingIndicator}>
             <ActivityIndicator size="small" color={colors.muted} />
             <Text style={[styles.typingText, { color: colors.muted }]}>正在思考...</Text>
@@ -265,7 +219,7 @@ const MessageItem = memo(function MessageItem({
             ]}
             selectable
           >
-            {item.content}
+            {displayContent}
             {item.isStreaming ? '▌' : ''}
           </Text>
         )}
@@ -286,6 +240,10 @@ export default function ChatScreen() {
   const [resolveToolCall, setResolveToolCall] = useState<((result: string) => void) | null>(null);
   const flatListRef = useRef<FlatList>(null);
 
+  // 用 ref 镜像 messages，避免 useCallback 闭包陷阱
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const assistantIdRef = useRef<string>('');
+
   const {
     messages,
     isGenerating,
@@ -303,10 +261,14 @@ export default function ChatScreen() {
 
   const activeModel = useAppStore(selectActiveModel);
 
-  // 初始化工作区：如果未设置，使用 FileSystem.documentDirectory + 'workspace/'
+  // 镜像 messages 到 ref
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // 初始化工作区
   useEffect(() => {
     if (!workspaceDir) {
-      // 动态加载避免在 SSR 阶段崩溃
       try {
         const { FileSystem } = require('expo-file-system/legacy');
         const base = FileSystem.documentDirectory || 'file:///data/data/space.manus.offline.ai.assistant.t20260106034740/files/';
@@ -328,7 +290,7 @@ export default function ChatScreen() {
     if (messages.length > 0) scrollToBottom();
   }, [messages.length, scrollToBottom]);
 
-  // 工具调用处理（workspaceDir 通过闭包从最新 store 获取）
+  // 工具调用处理
   const handleToolCall = useCallback(
     (toolCall: ToolCall): Promise<string> => {
       return new Promise((resolve) => {
@@ -395,7 +357,7 @@ export default function ChatScreen() {
     setResolveToolCall(null);
   }, [pendingToolCall, resolveToolCall]);
 
-  // 添加 activity 提示消息（独立的轻量行，不参与 assistant content）
+  // 添加 activity 提示消息
   const addActivity = useCallback(
     (kind: ChatMessage['activityType'], text: string, id?: string) => {
       const msg: ChatMessage = {
@@ -407,14 +369,89 @@ export default function ChatScreen() {
         activityType: kind,
       };
       addMessage(msg);
-      // 30 秒后自动清理（避免堆积）
-      setTimeout(() => {
-        try { removeMessage(msg.id); } catch {}
-      }, 30000);
       return msg.id;
     },
-    [addMessage, removeMessage]
+    [addMessage]
   );
+
+  // 移除指定 activity
+  const removeActivity = useCallback(
+    (id: string) => {
+      try { removeMessage(id); } catch {}
+    },
+    [removeMessage]
+  );
+
+  // 清除所有 activity 消息（推理完成后调用）
+  const clearAllActivities = useCallback(() => {
+    useAppStore.setState((state) => ({
+      messages: state.messages.filter((m) => !m.isActivity),
+    }));
+  }, []);
+
+  // 直接更新 assistant content —— 不通过 zustand updateMessage 函数（避免闭包）
+  const updateAssistantContent = useCallback((newContent: string) => {
+    const id = assistantIdRef.current;
+    if (!id) return;
+    // 直接 setState 合并到 store，避免走函数闭包
+    useAppStore.setState((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, content: newContent, isStreaming: true } : m
+      ),
+    }));
+  }, []);
+
+  // 推送 token —— RAF 节流版
+  const createPushToken = useCallback(() => {
+    let pending = '';
+    let rafHandle: number | null = null;
+    let baseContent = ''; // 上次已提交的 content
+
+    const flush = () => {
+      rafHandle = null;
+      if (pending.length > 0) {
+        const next = baseContent + pending;
+        pending = '';
+        baseContent = next;
+        updateAssistantContent(next);
+      }
+    };
+
+    return {
+      push(token: string) {
+        pending += token;
+        if (rafHandle == null) {
+          if (typeof requestAnimationFrame !== 'undefined') {
+            rafHandle = requestAnimationFrame(flush);
+          } else {
+            rafHandle = setTimeout(flush, 16) as unknown as number;
+          }
+        }
+      },
+      flush() {
+        if (rafHandle != null) {
+          if (typeof cancelAnimationFrame !== 'undefined') {
+            cancelAnimationFrame(rafHandle);
+          } else {
+            clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
+          }
+          rafHandle = null;
+        }
+        flush();
+      },
+      cancel() {
+        if (rafHandle != null) {
+          if (typeof cancelAnimationFrame !== 'undefined') {
+            cancelAnimationFrame(rafHandle);
+          } else {
+            clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
+          }
+          rafHandle = null;
+        }
+        pending = '';
+      },
+    };
+  }, [updateAssistantContent]);
 
   // 发送消息
   const handleSend = useCallback(async () => {
@@ -434,15 +471,14 @@ export default function ChatScreen() {
     setGenerating(true);
     setError(null);
 
+    // 创建 user + assistant 消息（同步写进 store）
     const userMsg: ChatMessage = {
-      id: `msg_${Date.now()}`,
+      id: `msg_${Date.now()}_u`,
       role: 'user',
       content: text,
       timestamp: Date.now(),
     };
-    addMessage(userMsg);
-
-    const assistantMsgId = `msg_${Date.now() + 1}`;
+    const assistantMsgId = `msg_${Date.now() + 1}_a`;
     const assistantMsg: ChatMessage = {
       id: assistantMsgId,
       role: 'assistant',
@@ -450,75 +486,87 @@ export default function ChatScreen() {
       timestamp: Date.now(),
       isStreaming: true,
     };
+    assistantIdRef.current = assistantMsgId;
+    addMessage(userMsg);
     addMessage(assistantMsg);
 
-    // 1. 思考提示
     const thinkingId = addActivity('thinking', 'AI 正在思考...');
-
-    // 2. 创建流式缓冲（破闭包 + RAF 节流）
-    let lastContentRef = { value: '' };
-    let buffer: StreamBuffer | null = null;
+    const pusher = createPushToken();
 
     try {
+      // 同步读取最新的 store 值（避免 stale closure）
+      const currentMessages = useAppStore.getState().messages;
+      const currentParams = useAppStore.getState().inferenceParams;
+      const currentTools = useAppStore.getState().toolsConfig;
       const ws = useAppStore.getState().workspaceDir;
 
-      buffer = createStreamBuffer(
-        () => lastContentRef.value,
-        (next) => {
-          lastContentRef.value = next;
-          updateMessage(assistantMsgId, { content: next });
-        }
-      );
+      // 让 UI 有机会渲染初始 assistant 消息（空内容 + isStreaming）
+      await new Promise((r) => setTimeout(r, 50));
 
       const finalText = await runInference(
         text,
-        messages,
-        toolsConfig,
-        inferenceParams,
+        currentMessages,
+        currentTools,
+        currentParams,
         ws,
-        (token) => buffer!.push(token),
+        (token) => pusher.push(token),
         handleToolCall,
         (kind, txt) => {
-          // 移除"思考中"提示（如果还在）
-          try { removeMessage(thinkingId); } catch {}
-          addActivity(kind, txt);
+          if (kind === 'streaming') {
+            // 更新同一个 thinking activity 行
+            useAppStore.setState((state) => ({
+              messages: state.messages.map((m) =>
+                m.id === thinkingId ? { ...m, activityType: kind, content: txt } : m
+              ),
+            }));
+          } else {
+            // 其他类型（tool_calling / tool_done / warning / error）添加新行
+            removeActivity(thinkingId);
+            addActivity(kind, txt);
+          }
         }
       );
 
       // flush 残余 token
-      buffer.flush();
-      // 移除所有 activity 提示（保留日志）
-      // 推理完成后统一清理：把 messages 中所有 isActivity=true 的删除
-      useAppStore.setState((state) => ({
-        messages: state.messages.filter((m) => !m.isActivity),
-      }));
+      pusher.flush();
+      // 移除所有 activity
+      clearAllActivities();
 
-      updateMessage(assistantMsgId, { content: finalText, isStreaming: false });
+      // 最终一次性写入（避免 RAF 节流期间遗漏）
+      useAppStore.setState((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === assistantMsgId ? { ...m, content: finalText, isStreaming: false } : m
+        ),
+      }));
     } catch (err) {
-      buffer?.cancel();
+      pusher.cancel();
       const errMsg = err instanceof Error ? err.message : '推理失败';
-      try { removeMessage(thinkingId); } catch {}
+      removeActivity(thinkingId);
       addActivity('error', `推理失败：${errMsg}`);
-      updateMessage(assistantMsgId, { content: `❌ ${errMsg}`, isStreaming: false });
+      useAppStore.setState((state) => ({
+        messages: state.messages.map((m) =>
+          m.id === assistantMsgId ? { ...m, content: `❌ ${errMsg}`, isStreaming: false } : m
+        ),
+      }));
       setError(errMsg);
     } finally {
       setGenerating(false);
+      assistantIdRef.current = '';
     }
   }, [
     inputText,
     isGenerating,
     activeModel,
-    messages,
-    toolsConfig,
-    inferenceParams,
     addMessage,
-    updateMessage,
     removeMessage,
     addLog,
     setGenerating,
     setError,
     handleToolCall,
     addActivity,
+    removeActivity,
+    clearAllActivities,
+    createPushToken,
   ]);
 
   const handleClearChat = useCallback(() => {
@@ -528,7 +576,6 @@ export default function ChatScreen() {
     ]);
   }, []);
 
-  // 渲染：根据 isActivity 路由到不同组件
   const renderItem = useCallback(
     ({ item }: { item: ChatMessage }) => {
       if (item.isActivity) {
@@ -639,8 +686,6 @@ export default function ChatScreen() {
             renderItem={renderItem}
             contentContainerStyle={styles.messageList}
             onContentSizeChange={scrollToBottom}
-            // 关键：聊天流式输出时 list 经常变，但 contentContainerStyle 是固定 style 对象引用
-            // removeClippedSubviews 关闭防止测量错误
             removeClippedSubviews={false}
             accessible={false}
           />
@@ -809,7 +854,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  // Activity 行（轻量提示）
+  // Activity 提示行
   activityRow: {
     flexDirection: 'row',
     alignItems: 'center',
