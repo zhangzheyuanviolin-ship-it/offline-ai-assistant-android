@@ -144,12 +144,23 @@ interface ParsedContent {
 }
 
 function parseThinkingTags(text: string): ParsedContent {
-  // \u5339\u914d <think>...</think> \u6216 <thinking>...</thinking>
+  // 先尝试匹配完整的 <think>...</think> 或 <thinking>...</thinking>
   const thinkMatch = text.match(/<(?:think|thinking)>([\s\S]*?)<\/(?:think|thinking)>/);
   if (thinkMatch) {
     const thinking = thinkMatch[1].trim();
     const response = text.replace(thinkMatch[0], '').trim();
     return { thinking, response };
+  }
+  // 流式输出时标签可能尚未闭合：检测未闭合的 <think> 或 <thinking> 开标签
+  const openMatch = text.match(/<(?:think|thinking)>([\s\S]*)$/);
+  if (openMatch) {
+    // 标签已开但未闭合，内容全部是思考过程
+    return { thinking: openMatch[1].trim(), response: '' };
+  }
+  // 检测是否刚刚闭合了思考标签但回复还没开始
+  const closedButEmpty = text.match(/^\s*<\/(?:think|thinking)>\s*$/);
+  if (closedButEmpty) {
+    return { thinking: '', response: '' };
   }
   return { thinking: '', response: text };
 }
@@ -467,11 +478,11 @@ export default function ChatScreen() {
   // \u521b\u5efa token \u63a8\u9001\u5668\uff08\u7eaf\u672c\u5730 useState\uff0c\u4e0d\u8d70 store\uff09
   const createPushToken = useCallback(() => {
     let pending = '';
-    let rafHandle: number | null = null;
+    let timerHandle: number | null = null;
     let baseContent = '';
 
     const flush = () => {
-      rafHandle = null;
+      timerHandle = null;
       if (pending.length > 0) {
         const next = baseContent + pending;
         pending = '';
@@ -483,33 +494,21 @@ export default function ChatScreen() {
     return {
       push(token: string) {
         pending += token;
-        if (rafHandle == null) {
-          if (typeof requestAnimationFrame !== 'undefined') {
-            rafHandle = requestAnimationFrame(flush);
-          } else {
-            rafHandle = setTimeout(flush, 32) as unknown as number;
-          }
+        if (timerHandle == null) {
+          timerHandle = setTimeout(flush, 80) as unknown as number;
         }
       },
       flush() {
-        if (rafHandle != null) {
-          if (typeof cancelAnimationFrame !== 'undefined') {
-            cancelAnimationFrame(rafHandle);
-          } else {
-            clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
-          }
-          rafHandle = null;
+        if (timerHandle != null) {
+          clearTimeout(timerHandle as unknown as ReturnType<typeof setTimeout>);
+          timerHandle = null;
         }
         flush();
       },
       cancel() {
-        if (rafHandle != null) {
-          if (typeof cancelAnimationFrame !== 'undefined') {
-            cancelAnimationFrame(rafHandle);
-          } else {
-            clearTimeout(rafHandle as unknown as ReturnType<typeof setTimeout>);
-          }
-          rafHandle = null;
+        if (timerHandle != null) {
+          clearTimeout(timerHandle as unknown as ReturnType<typeof setTimeout>);
+          timerHandle = null;
         }
         pending = '';
       },
@@ -768,8 +767,7 @@ export default function ChatScreen() {
             editable={!isGenerating && !!activeModel?.isLoaded}
             returnKeyType="default"
             accessible
-            accessibilityRole="none"
-            accessibilityLabel="\u6d88\u606f\u8f93\u5165\u6846"
+                        accessibilityLabel="\u6d88\u606f\u8f93\u5165\u6846"
             accessibilityHint={activeModel?.isLoaded ? '\u8f93\u5165\u60a8\u7684\u6d88\u606f\uff0c\u7136\u540e\u70b9\u51fb\u53d1\u9001' : '\u8bf7\u5148\u5728\u6a21\u578b\u9875\u9762\u52a0\u8f7d\u4e00\u4e2a GGUF \u6a21\u578b'}
           />
           <TouchableOpacity
