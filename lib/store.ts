@@ -12,6 +12,7 @@ import {
   ToolLog,
   ToolsConfig,
 } from './types';
+import { getActiveContext } from './services/model-service';
 
 interface AppStore extends AppState {
   // 模型管理
@@ -20,6 +21,7 @@ interface AppStore extends AppState {
   setActiveModel: (modelId: string | null) => void;
   setModelLoaded: (modelId: string, loaded: boolean) => void;
   loadModelsFromStorage: () => Promise<void>;
+  syncModelLoadedState: () => void;
 
   // 推理参数
   setInferenceParams: (params: Partial<InferenceParams>) => void;
@@ -51,6 +53,13 @@ interface AppStore extends AppState {
   setError: (error: string | null) => void;
 }
 
+// 持久化消息到 AsyncStorage（节流：只在非流式消息时持久化）
+function persistMessages(messages: ChatMessage[]) {
+  // 只持久化非 activity 消息，且只持久化非流式中的消息
+  const toSave = messages.filter(m => !m.isActivity && !m.isStreaming);
+  AsyncStorage.setItem('messages', JSON.stringify(toSave)).catch(() => {});
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
   // ─── Initial State ────────────────────────────────────────────────────────
   models: [],
@@ -62,8 +71,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
   isGenerating: false,
   contextId: null,
   error: null,
-  // 默认工作区：FileSystem.documentDirectory + 'workspace/'
-  // 由调用方（ChatScreen / settings）在挂载时覆盖为真实绝对路径
   workspaceDir: '',
 
   // ─── Model Management ─────────────────────────────────────────────────────
@@ -80,6 +87,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const updated = state.models.filter((m) => m.id !== modelId);
       AsyncStorage.setItem('models', JSON.stringify(updated)).catch(() => {});
       const activeModelId = state.activeModelId === modelId ? null : state.activeModelId;
+      AsyncStorage.setItem('activeModelId', activeModelId ?? '').catch(() => {});
       return { models: updated, activeModelId };
     });
   },
@@ -99,12 +107,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   loadModelsFromStorage: async () => {
     try {
-      const [modelsJson, activeId, paramsJson, toolsJson, wsJson] = await Promise.all([
+      const [modelsJson, activeId, paramsJson, toolsJson, wsJson, messagesJson] = await Promise.all([
         AsyncStorage.getItem('models'),
         AsyncStorage.getItem('activeModelId'),
         AsyncStorage.getItem('inferenceParams'),
         AsyncStorage.getItem('toolsConfig'),
         AsyncStorage.getItem('workspaceDir'),
+        AsyncStorage.getItem('messages'),
       ]);
       const models: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
       const inferenceParams = paramsJson
@@ -113,15 +122,36 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const toolsConfig = toolsJson
         ? { ...DEFAULT_TOOLS_CONFIG, ...JSON.parse(toolsJson) }
         : DEFAULT_TOOLS_CONFIG;
+      const messages: ChatMessage[] = messagesJson ? JSON.parse(messagesJson) : [];
       set({
         models: models.map((m) => ({ ...m, isLoaded: false })),
         activeModelId: activeId || null,
         inferenceParams,
         toolsConfig,
         workspaceDir: wsJson || '',
+        messages,
       });
     } catch {
       // ignore storage errors
+    }
+  },
+
+  // 检查 native 侧模型上下文是否仍然存活，同步 isLoaded 状态
+  syncModelLoadedState: () => {
+    const ctx = getActiveContext();
+    const state = get();
+    if (ctx && state.activeModelId) {
+      // native 上下文存在，标记对应模型为已加载
+      set({
+        models: state.models.map((m) =>
+          m.id === state.activeModelId ? { ...m, isLoaded: true } : { ...m, isLoaded: false }
+        ),
+      });
+    } else {
+      // native 上下文不存在，所有模型标记为未加载
+      set({
+        models: state.models.map((m) => ({ ...m, isLoaded: false })),
+      });
     }
   },
 
@@ -193,7 +223,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   // ─── Messages ─────────────────────────────────────────────────────────────
   addMessage: (message) => {
-    set((state) => ({ messages: [...state.messages, message] }));
+    set((state) => {
+      const updated = [...state.messages, message];
+      // 只持久化非 activity、非 streaming 的消息
+      if (!message.isActivity && !message.isStreaming) {
+        persistMessages(updated);
+      }
+      return { messages: updated };
+    });
   },
 
   updateMessage: (messageId, updates) => {
@@ -219,15 +256,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   removeMessage: (messageId) => {
-    set((state) => ({ messages: state.messages.filter((m) => m.id !== messageId) }));
+    set((state) => {
+      const updated = state.messages.filter((m) => m.id !== messageId);
+      persistMessages(updated);
+      return { messages: updated };
+    });
   },
 
-  clearMessages: () => set({ messages: [] }),
+  clearMessages: () => {
+    set({ messages: [] });
+    AsyncStorage.removeItem('messages').catch(() => {});
+  },
 
   // ─── Logs ─────────────────────────────────────────────────────────────────
   addLog: (log) => {
     set((state) => {
-      const updated = [...state.logs, log].slice(-50); // 最多保留 50 条
+      const updated = [...state.logs, log].slice(-50);
       return { logs: updated };
     });
   },
