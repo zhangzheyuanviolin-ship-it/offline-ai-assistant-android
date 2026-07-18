@@ -36,15 +36,15 @@ export interface InferenceParams {
 }
 
 export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
-  n_ctx: 4096,
-  n_batch: 512,
+  n_ctx: 2048,
+  n_batch: 256,
   n_threads: 4,
   n_gpu_layers: 0,
   temperature: 0.7,
   top_p: 0.9,
   top_k: 40,
   repeat_penalty: 1.1,
-  max_tokens: 2048,
+  max_tokens: 1024,
   // 过滤掉空字符串，避免传给 llama.rn 时触发异常
   stop: ['<|end|>', '</s>', '', '<|endoftext|>'],
 };
