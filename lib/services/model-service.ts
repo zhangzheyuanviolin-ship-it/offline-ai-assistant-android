@@ -97,6 +97,7 @@ export async function loadModel(
       n_gpu_layers: params.n_gpu_layers,
       use_mlock: false,
       use_mmap: true,
+      no_extra_bufts: true,
     },
     (progress) => {
       onProgress?.(progress);
