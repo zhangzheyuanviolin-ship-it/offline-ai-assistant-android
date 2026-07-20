@@ -12,56 +12,47 @@ import {
   ToolLog,
   ToolsConfig,
 } from './types';
-import { getActiveContext } from './services/model-service';
+import { getActiveContext, getActiveModelId } from './services/model-service';
 
 interface AppStore extends AppState {
-  // 模型管理
   addModel: (model: AIModel) => void;
   removeModel: (modelId: string) => void;
   setActiveModel: (modelId: string | null) => void;
   setModelLoaded: (modelId: string, loaded: boolean) => void;
   loadModelsFromStorage: () => Promise<void>;
   syncModelLoadedState: () => void;
-
-  // 推理参数
   setInferenceParams: (params: Partial<InferenceParams>) => void;
-
-  // 工具配置
   setToolsConfig: (config: Partial<ToolsConfig>) => void;
   toggleToolCategory: (category: 'WebSearch' | 'Files' | 'Media') => void;
   setSearchEngine: (engine: SearchEngine) => void;
   setSearchApiKey: (provider: 'tavily' | 'exa', key: string) => void;
   setSearchMaxResults: (n: number) => void;
-
-  // 聊天消息
   addMessage: (message: ChatMessage) => void;
   updateMessage: (messageId: string, updates: Partial<ChatMessage>) => void;
   updateToolCall: (messageId: string, toolCallId: string, updates: Partial<ToolCall>) => void;
   removeMessage: (messageId: string) => void;
   clearMessages: () => void;
-
-  // 工具日志
   addLog: (log: ToolLog) => void;
   clearLogs: () => void;
-
-  // 工作区
   setWorkspaceDir: (dir: string) => void;
-
-  // 推理状态
   setGenerating: (generating: boolean) => void;
   setContextId: (id: string | null) => void;
   setError: (error: string | null) => void;
 }
 
-// 持久化消息到 AsyncStorage（节流：只在非流式消息时持久化）
+let storageLoadPromise: Promise<void> | null = null;
+
 function persistMessages(messages: ChatMessage[]) {
-  // 只持久化非 activity 消息，且只持久化非流式中的消息
-  const toSave = messages.filter(m => !m.isActivity && !m.isStreaming);
+  const toSave = messages.filter((message) => !message.isActivity && !message.isStreaming);
   AsyncStorage.setItem('messages', JSON.stringify(toSave)).catch(() => {});
 }
 
+function persistModels(models: AIModel[]) {
+  const serializable = models.map((model) => ({ ...model, isLoaded: false }));
+  AsyncStorage.setItem('models', JSON.stringify(serializable)).catch(() => {});
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
-  // ─── Initial State ────────────────────────────────────────────────────────
   models: [],
   activeModelId: null,
   inferenceParams: DEFAULT_INFERENCE_PARAMS,
@@ -73,20 +64,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
   error: null,
   workspaceDir: '',
 
-  // ─── Model Management ─────────────────────────────────────────────────────
   addModel: (model) => {
     set((state) => {
       const updated = [...state.models, model];
-      AsyncStorage.setItem('models', JSON.stringify(updated)).catch(() => {});
+      persistModels(updated);
       return { models: updated };
     });
   },
 
   removeModel: (modelId) => {
     set((state) => {
-      const updated = state.models.filter((m) => m.id !== modelId);
-      AsyncStorage.setItem('models', JSON.stringify(updated)).catch(() => {});
+      const updated = state.models.filter((model) => model.id !== modelId);
       const activeModelId = state.activeModelId === modelId ? null : state.activeModelId;
+      persistModels(updated);
       AsyncStorage.setItem('activeModelId', activeModelId ?? '').catch(() => {});
       return { models: updated, activeModelId };
     });
@@ -99,63 +89,67 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setModelLoaded: (modelId, loaded) => {
     set((state) => ({
-      models: state.models.map((m) =>
-        m.id === modelId ? { ...m, isLoaded: loaded } : m
+      models: state.models.map((model) =>
+        model.id === modelId ? { ...model, isLoaded: loaded } : { ...model, isLoaded: false }
       ),
     }));
   },
 
   loadModelsFromStorage: async () => {
-    try {
-      const [modelsJson, activeId, paramsJson, toolsJson, wsJson, messagesJson] = await Promise.all([
-        AsyncStorage.getItem('models'),
-        AsyncStorage.getItem('activeModelId'),
-        AsyncStorage.getItem('inferenceParams'),
-        AsyncStorage.getItem('toolsConfig'),
-        AsyncStorage.getItem('workspaceDir'),
-        AsyncStorage.getItem('messages'),
-      ]);
-      const models: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
-      const inferenceParams = paramsJson
-        ? { ...DEFAULT_INFERENCE_PARAMS, ...JSON.parse(paramsJson) }
-        : DEFAULT_INFERENCE_PARAMS;
-      const toolsConfig = toolsJson
-        ? { ...DEFAULT_TOOLS_CONFIG, ...JSON.parse(toolsJson) }
-        : DEFAULT_TOOLS_CONFIG;
-      const messages: ChatMessage[] = messagesJson ? JSON.parse(messagesJson) : [];
-      set({
-        models: models.map((m) => ({ ...m, isLoaded: false })),
-        activeModelId: activeId || null,
-        inferenceParams,
-        toolsConfig,
-        workspaceDir: wsJson || '',
-        messages,
-      });
-    } catch {
-      // ignore storage errors
-    }
+    if (storageLoadPromise) return storageLoadPromise;
+
+    storageLoadPromise = (async () => {
+      try {
+        const [modelsJson, activeId, paramsJson, toolsJson, wsJson, messagesJson] = await Promise.all([
+          AsyncStorage.getItem('models'),
+          AsyncStorage.getItem('activeModelId'),
+          AsyncStorage.getItem('inferenceParams'),
+          AsyncStorage.getItem('toolsConfig'),
+          AsyncStorage.getItem('workspaceDir'),
+          AsyncStorage.getItem('messages'),
+        ]);
+
+        const storedModels: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
+        const nativeModelId = getActiveContext() ? getActiveModelId() : null;
+        const inferenceParams = paramsJson
+          ? { ...DEFAULT_INFERENCE_PARAMS, ...JSON.parse(paramsJson) }
+          : DEFAULT_INFERENCE_PARAMS;
+        const storedTools = toolsJson ? JSON.parse(toolsJson) : {};
+        const toolsConfig: ToolsConfig = {
+          ...DEFAULT_TOOLS_CONFIG,
+          ...storedTools,
+          WebSearch: { ...DEFAULT_TOOLS_CONFIG.WebSearch, ...(storedTools.WebSearch ?? {}) },
+          Files: { ...DEFAULT_TOOLS_CONFIG.Files, ...(storedTools.Files ?? {}) },
+          Media: { ...DEFAULT_TOOLS_CONFIG.Media, ...(storedTools.Media ?? {}) },
+        };
+        const messages: ChatMessage[] = messagesJson ? JSON.parse(messagesJson) : [];
+
+        set({
+          models: storedModels.map((model) => ({ ...model, isLoaded: model.id === nativeModelId })),
+          activeModelId: nativeModelId ?? activeId ?? null,
+          inferenceParams,
+          toolsConfig,
+          workspaceDir: wsJson || '',
+          messages,
+        });
+      } catch (error) {
+        console.warn('Failed to load persisted app state', error);
+      } finally {
+        storageLoadPromise = null;
+      }
+    })();
+
+    return storageLoadPromise;
   },
 
-  // 检查 native 侧模型上下文是否仍然存活，同步 isLoaded 状态
   syncModelLoadedState: () => {
-    const ctx = getActiveContext();
-    const state = get();
-    if (ctx && state.activeModelId) {
-      // native 上下文存在，标记对应模型为已加载
-      set({
-        models: state.models.map((m) =>
-          m.id === state.activeModelId ? { ...m, isLoaded: true } : { ...m, isLoaded: false }
-        ),
-      });
-    } else {
-      // native 上下文不存在，所有模型标记为未加载
-      set({
-        models: state.models.map((m) => ({ ...m, isLoaded: false })),
-      });
-    }
+    const nativeModelId = getActiveContext() ? getActiveModelId() : null;
+    set((state) => ({
+      activeModelId: nativeModelId ?? state.activeModelId,
+      models: state.models.map((model) => ({ ...model, isLoaded: model.id === nativeModelId })),
+    }));
   },
 
-  // ─── Inference Params ─────────────────────────────────────────────────────
   setInferenceParams: (params) => {
     set((state) => {
       const updated = { ...state.inferenceParams, ...params };
@@ -164,7 +158,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
   },
 
-  // ─── Tool Config ──────────────────────────────────────────────────────────
   setToolsConfig: (config) => {
     set((state) => {
       const updated = { ...state.toolsConfig, ...config };
@@ -214,41 +207,42 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set((state) => {
       const updated = {
         ...state.toolsConfig,
-        WebSearch: { ...state.toolsConfig.WebSearch, maxResults: Math.max(1, Math.min(20, n)) },
+        WebSearch: {
+          ...state.toolsConfig.WebSearch,
+          maxResults: Math.max(1, Math.min(20, n)),
+        },
       };
       AsyncStorage.setItem('toolsConfig', JSON.stringify(updated)).catch(() => {});
       return { toolsConfig: updated };
     });
   },
 
-  // ─── Messages ─────────────────────────────────────────────────────────────
   addMessage: (message) => {
     set((state) => {
       const updated = [...state.messages, message];
-      // 只持久化非 activity、非 streaming 的消息
-      if (!message.isActivity && !message.isStreaming) {
-        persistMessages(updated);
-      }
+      if (!message.isActivity && !message.isStreaming) persistMessages(updated);
       return { messages: updated };
     });
   },
 
   updateMessage: (messageId, updates) => {
-    set((state) => ({
-      messages: state.messages.map((m) =>
-        m.id === messageId ? { ...m, ...updates } : m
-      ),
-    }));
+    set((state) => {
+      const updated = state.messages.map((message) =>
+        message.id === messageId ? { ...message, ...updates } : message
+      );
+      persistMessages(updated);
+      return { messages: updated };
+    });
   },
 
   updateToolCall: (messageId, toolCallId, updates) => {
     set((state) => ({
-      messages: state.messages.map((m) => {
-        if (m.id !== messageId || !m.toolCalls) return m;
+      messages: state.messages.map((message) => {
+        if (message.id !== messageId || !message.toolCalls) return message;
         return {
-          ...m,
-          toolCalls: m.toolCalls.map((tc) =>
-            tc.id === toolCallId ? { ...tc, ...updates } : tc
+          ...message,
+          toolCalls: message.toolCalls.map((toolCall) =>
+            toolCall.id === toolCallId ? { ...toolCall, ...updates } : toolCall
           ),
         };
       }),
@@ -257,7 +251,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   removeMessage: (messageId) => {
     set((state) => {
-      const updated = state.messages.filter((m) => m.id !== messageId);
+      const updated = state.messages.filter((message) => message.id !== messageId);
       persistMessages(updated);
       return { messages: updated };
     });
@@ -268,28 +262,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
     AsyncStorage.removeItem('messages').catch(() => {});
   },
 
-  // ─── Logs ─────────────────────────────────────────────────────────────────
-  addLog: (log) => {
-    set((state) => {
-      const updated = [...state.logs, log].slice(-50);
-      return { logs: updated };
-    });
-  },
-
+  addLog: (log) => set((state) => ({ logs: [...state.logs, log].slice(-50) })),
   clearLogs: () => set({ logs: [] }),
 
-  // ─── Workspace ────────────────────────────────────────────────────────────
   setWorkspaceDir: (dir) => {
     set({ workspaceDir: dir });
     AsyncStorage.setItem('workspaceDir', dir).catch(() => {});
   },
 
-  // ─── Inference State ──────────────────────────────────────────────────────
   setGenerating: (isGenerating) => set({ isGenerating }),
   setContextId: (contextId) => set({ contextId }),
   setError: (error) => set({ error }),
 }));
 
-// 便捷选择器
 export const selectActiveModel = (state: AppStore) =>
-  state.models.find((m) => m.id === state.activeModelId) ?? null;
+  state.models.find((model) => model.id === state.activeModelId) ?? null;
