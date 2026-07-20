@@ -2,7 +2,7 @@ name: Build Signed Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, agent/build19-diagnostics-stability]
   workflow_dispatch:
     inputs:
       version_name:
@@ -20,33 +20,27 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # ── Checkout ──────────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Java ──────────────────────────────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── pnpm (must come before setup-node to avoid version conflict) ──────────
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      # ── Node ──────────────────────────────────────────────────────────────────
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'pnpm'
 
-      # ── Dependencies ──────────────────────────────────────────────────────────
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      # ── Gradle cache ─────────────────────────────────────────────────────────
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -57,23 +51,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ── Expo Prebuild ─────────────────────────────────────────────────────────
       - name: Expo prebuild (Android)
-        run: |
-          npx expo prebuild --platform android --clean --no-install
+        run: npx expo prebuild --platform android --clean --no-install
         env:
           EXPO_NO_TELEMETRY: 1
 
-      # ── Keystore ──────────────────────────────────────────────────────────────
       - name: Decode and place keystore
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/offline-ai-assistant.keystore
           ls -lh android/app/offline-ai-assistant.keystore
 
-      # ── Signing config ────────────────────────────────────────────────────────
       - name: Configure signing in build.gradle
         run: |
-          # Inject signing config into android/app/build.gradle
           python3 - << 'PYEOF'
           import re
 
@@ -91,11 +80,9 @@ jobs:
               }
           """
 
-          # Insert signingConfigs before buildTypes
           if 'signingConfigs' not in content:
               content = content.replace('    buildTypes {', signing_config + '    buildTypes {')
 
-          # Set release buildType to use release signingConfig
           content = re.sub(
               r'(buildTypes\s*\{[^}]*release\s*\{)',
               r'\1\n            signingConfig signingConfigs.release',
@@ -109,7 +96,6 @@ jobs:
           print("Signing config injected successfully")
           PYEOF
 
-      # ── Build APK ─────────────────────────────────────────────────────────────
       - name: Build release APK
         run: |
           cd android
@@ -124,7 +110,6 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      # ── Rename APK ────────────────────────────────────────────────────────────
       - name: Rename and move APK
         run: |
           VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
@@ -143,7 +128,6 @@ jobs:
           echo "APK_PATH=dist/$APK_NAME" >> $GITHUB_ENV
           ls -lh "dist/$APK_NAME"
 
-      # ── Upload artifact ───────────────────────────────────────────────────────
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -151,36 +135,21 @@ jobs:
           path: ${{ env.APK_PATH }}
           retention-days: 90
 
-      # ── Create Release ────────────────────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant APK
+            ## Offline AI Assistant build19 diagnostic release
 
-            **版本**: v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})
-
-            ### 功能
-            - 本地离线 AI 推理（llama.rn + llama.cpp 最新版 b9888）
-            - 聊天界面（流式输出）
-            - GGUF 模型管理（导入/加载/卸载/删除）
-            - 文件管理工具（ls/cat/write/mkdir/rm/mv/zip）
-            - 多媒体处理工具（media_info/media_proc）
-            - 网络搜索工具（Tavily AI / Exa AI / DuckDuckGo / 百度）
-            - 推理参数设置（上下文长度/温度/重复惩罚等）
-            - 完整无障碍支持（TalkBack）
-            - 工具调用日志系统
-
-            ### 安装说明
-            1. 下载 APK 文件
-            2. 在 Android 设置中允许安装未知来源应用
-            3. 点击 APK 文件安装
-            4. 首次使用需导入 GGUF 格式的模型文件
-
-            ### 签名信息
-            此 APK 使用持久化签名，后续版本可直接覆盖更新，无需卸载。
+            - Native prefill and decode timing is appended to each response.
+            - Duplicate final user prompts are removed before inference.
+            - Model contexts cannot be released or replaced during generation.
+            - Tool-call JSON is no longer cut off by conflicting stop strings.
+            - Persisted model state is synchronized with the native llama context.
+            - Unimplemented media processing is disabled by default.
+            - `no_extra_bufts` remains unchanged for direct comparison with build18.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
