@@ -47,8 +47,20 @@ function persistMessages(messages: ChatMessage[]) {
   AsyncStorage.setItem('messages', JSON.stringify(toSave)).catch(() => {});
 }
 
+function normalizeModel(model: AIModel, nativeModelId: string | null): AIModel {
+  const storageMode = model.storageMode ?? (
+    model.sourceUri || model.filePath.startsWith('content://') ? 'external' : 'copied'
+  );
+  return {
+    ...model,
+    storageMode,
+    sourceUri: model.sourceUri ?? (model.filePath.startsWith('content://') ? model.filePath : undefined),
+    isLoaded: model.id === nativeModelId,
+  };
+}
+
 function persistModels(models: AIModel[]) {
-  const serializable = models.map((model) => ({ ...model, isLoaded: false, storageMode: model.storageMode ?? (model.filePath.startsWith('content://') ? 'external' : 'copied') }));
+  const serializable = models.map((model) => ({ ...model, isLoaded: false }));
   AsyncStorage.setItem('models', JSON.stringify(serializable)).catch(() => {});
 }
 
@@ -97,24 +109,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   loadModelsFromStorage: async () => {
     if (storageLoadPromise) return storageLoadPromise;
-
     storageLoadPromise = (async () => {
       try {
-        const [modelsJson, activeId, paramsJson, toolsJson, wsJson, messagesJson] = await Promise.all([
+        const [modelsJson, paramsJson, toolsJson, wsJson, messagesJson] = await Promise.all([
           AsyncStorage.getItem('models'),
-          AsyncStorage.getItem('activeModelId'),
           AsyncStorage.getItem('inferenceParams'),
           AsyncStorage.getItem('toolsConfig'),
           AsyncStorage.getItem('workspaceDir'),
           AsyncStorage.getItem('messages'),
         ]);
-
         const storedModels: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
-        const BUILD41_RUNTIME_STATE_AUTHORITY = true;
         const nativeModelId = getActiveContext() ? getActiveModelId() : null;
-        const inferenceParams = paramsJson
-          ? { ...DEFAULT_INFERENCE_PARAMS, ...JSON.parse(paramsJson) }
-          : DEFAULT_INFERENCE_PARAMS;
+        const storedParams = paramsJson ? JSON.parse(paramsJson) : {};
+        const inferenceParams: InferenceParams = {
+          ...DEFAULT_INFERENCE_PARAMS,
+          ...storedParams,
+        };
         const storedTools = toolsJson ? JSON.parse(toolsJson) : {};
         const toolsConfig: ToolsConfig = {
           ...DEFAULT_TOOLS_CONFIG,
@@ -124,14 +134,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
           Media: { ...DEFAULT_TOOLS_CONFIG.Media, ...(storedTools.Media ?? {}) },
         };
         const messages: ChatMessage[] = messagesJson ? JSON.parse(messagesJson) : [];
-
         set({
-          models: storedModels.map((model) => ({
-            ...model,
-            storageMode: model.storageMode ?? (model.filePath.startsWith('content://') ? 'external' : 'copied'),
-            sourceUri: model.sourceUri ?? (model.filePath.startsWith('content://') ? model.filePath : undefined),
-            isLoaded: model.id === nativeModelId,
-          })),
+          models: storedModels.map((model) => normalizeModel(model, nativeModelId)),
           activeModelId: nativeModelId,
           inferenceParams,
           toolsConfig,
@@ -144,14 +148,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
         storageLoadPromise = null;
       }
     })();
-
     return storageLoadPromise;
   },
 
   syncModelLoadedState: () => {
     const nativeModelId = getActiveContext() ? getActiveModelId() : null;
     set((state) => ({
-      activeModelId: nativeModelId ?? state.activeModelId,
+      activeModelId: nativeModelId,
       models: state.models.map((model) => ({ ...model, isLoaded: model.id === nativeModelId })),
     }));
   },
