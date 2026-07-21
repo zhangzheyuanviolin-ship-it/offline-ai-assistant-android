@@ -34,6 +34,20 @@ if (!mainApplication.includes('OfflineAiNativePackage()')) {
   fs.writeFileSync(mainApplicationPath, mainApplication, 'utf8');
 }
 
+const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+let manifest = fs.readFileSync(manifestPath, 'utf8');
+const permissions = [
+  '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />',
+  '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />',
+];
+for (const permission of permissions) {
+  const permissionName = permission.match(/android:name="([^"]+)"/)?.[1];
+  if (permissionName && !manifest.includes(permissionName)) {
+    manifest = manifest.replace(/<manifest([^>]*)>/, (match) => `${match}\n  ${permission}`);
+  }
+}
+fs.writeFileSync(manifestPath, manifest, 'utf8');
+
 const packageDir = path.dirname(mainApplicationPath);
 const externalModulePath = path.join(packageDir, 'ExternalModelFileModule.kt');
 const memoryModulePath = path.join(packageDir, 'RuntimeMemoryModule.kt');
@@ -43,9 +57,11 @@ const externalModuleSource = `package ${packageName}
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.system.Os
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -58,6 +74,39 @@ class ExternalModelFileModule(
   private val context: ReactApplicationContext
 ) : ReactContextBaseJavaModule(context) {
   override fun getName(): String = "ExternalModelFile"
+
+  private fun hasDirectStorageAccess(): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+
+  @ReactMethod
+  fun hasAllFilesAccess(promise: Promise) {
+    promise.resolve(hasDirectStorageAccess())
+  }
+
+  @ReactMethod
+  fun requestAllFilesAccess(promise: Promise) {
+    try {
+      if (hasDirectStorageAccess()) {
+        promise.resolve(false)
+        return
+      }
+      val intent = Intent(
+        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+        Uri.parse("package:\${context.packageName}")
+      ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      context.startActivity(intent)
+      promise.resolve(true)
+    } catch (_: Exception) {
+      try {
+        val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(fallback)
+        promise.resolve(true)
+      } catch (error: Exception) {
+        promise.reject("ALL_FILES_SETTINGS_FAILED", error.message, error)
+      }
+    }
+  }
 
   private fun readableFile(path: String?): File? {
     if (path.isNullOrBlank()) return null
@@ -123,13 +172,16 @@ class ExternalModelFileModule(
       if (uri.scheme != "content") {
         throw IllegalArgumentException("不支持的模型 URI：\${uri.scheme}")
       }
+      if (!hasDirectStorageAccess()) {
+        throw SecurityException("直接使用本机原文件需要在系统设置中允许“所有文件访问权限”。授权后重新导入；也可以改用复制到应用目录。")
+      }
 
       var persisted = false
       try {
         context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         persisted = true
       } catch (_: Exception) {
-        // Expo DocumentPicker 不一定保留 FLAG_GRANT_PERSISTABLE_URI_PERMISSION。
+        // 真实路径模式依赖所有文件访问权限，不依赖临时 content URI 生命周期。
       }
 
       val documentFile = pathFromDocumentUri(uri)
@@ -139,7 +191,7 @@ class ExternalModelFileModule(
       val file = documentFile ?: descriptorFile
       if (file == null) {
         throw IllegalStateException(
-          "该文件来源只提供 content:// 代理流，llama.rn 无法把它作为普通 GGUF 路径进行 mmap。请使用“复制到应用”导入；本机内部存储或 SD 卡中的真实文件才能直接使用原文件。"
+          "该文件来源只提供 content:// 代理流，llama.rn 无法把它作为普通 GGUF 路径进行 mmap。请使用“复制到应用目录”；只有本机内部存储或 SD 卡中的真实文件可以直接使用。"
         )
       }
 
@@ -284,4 +336,8 @@ const verifiedMain = fs.readFileSync(mainApplicationPath, 'utf8');
 if (!verifiedMain.includes('add(OfflineAiNativePackage())')) {
   throw new Error('[native-bridge] package registration validation failed');
 }
-console.log(`[native-bridge] injected external model resolver and memory diagnostics into ${packageName}`);
+const verifiedManifest = fs.readFileSync(manifestPath, 'utf8');
+if (!verifiedManifest.includes('android.permission.MANAGE_EXTERNAL_STORAGE')) {
+  throw new Error('[native-bridge] MANAGE_EXTERNAL_STORAGE permission injection failed');
+}
+console.log(`[native-bridge] injected external model resolver, storage permission and memory diagnostics into ${packageName}`);
