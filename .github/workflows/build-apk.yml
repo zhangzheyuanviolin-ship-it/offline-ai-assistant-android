@@ -54,6 +54,10 @@ jobs:
               'return content.slice(0, startIndex) + replacement + content.slice(endIndex);',
               'return content.slice(0, startIndex) + replacement + content.slice(endIndex + end.length);'
           )
+          content = content.replace(
+              'const loopEnd = "  onActivity(\'streaming\', `生成完成（${tokenCount} tokens）`);";',
+              "const loopEnd = '  return fullResponse;' ;"
+          )
           open(path, 'w', encoding='utf-8').write(content)
           PYEOF
           set +e
