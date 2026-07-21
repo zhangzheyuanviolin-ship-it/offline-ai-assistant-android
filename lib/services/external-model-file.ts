@@ -1,38 +1,44 @@
 import { NativeModules, Platform } from 'react-native';
 
-interface ExternalModelOpenResult {
+export interface ExternalModelResolveResult {
   path: string;
   size: number;
   seekable: boolean;
   persisted: boolean;
+  direct: boolean;
 }
 
 interface ExternalModelFileNativeModule {
-  open(uri: string): Promise<ExternalModelOpenResult>;
+  resolve(uri: string): Promise<ExternalModelResolveResult>;
+  open(uri: string): Promise<ExternalModelResolveResult>;
   close(uri: string): Promise<void>;
   closeAll(): Promise<void>;
 }
 
 const nativeModule = NativeModules.ExternalModelFile as ExternalModelFileNativeModule | undefined;
 
-export async function openExternalModelUri(uri: string): Promise<ExternalModelOpenResult> {
+export async function resolveExternalModelUri(uri: string): Promise<ExternalModelResolveResult> {
   if (uri.startsWith('file://')) {
-    return { path: uri, size: -1, seekable: true, persisted: true };
+    return { path: uri, size: -1, seekable: true, persisted: true, direct: true };
   }
   if (!uri.startsWith('content://')) {
-    return { path: uri, size: -1, seekable: true, persisted: true };
+    return { path: uri, size: -1, seekable: true, persisted: true, direct: true };
   }
   if (Platform.OS !== 'android') {
-    throw new Error('当前平台暂不支持直接引用 content URI，请改用复制导入');
+    throw new Error('当前平台不支持直接使用 content URI，请使用复制导入');
   }
   if (!nativeModule) {
-    throw new Error('外部模型文件桥接模块未加载，请重新安装完整构建版本');
+    throw new Error('外部模型路径解析模块未加载，请安装包含原生桥接的完整版本');
   }
-  const result = await nativeModule.open(uri);
-  if (!result?.path || !result.seekable) {
-    throw new Error('该文件提供方不支持随机读取或内存映射，请改用复制导入');
+  const result = await nativeModule.resolve(uri);
+  if (!result?.path || !result.seekable || !result.direct) {
+    throw new Error('该文件来源不能解析为可供 llama.rn mmap 的真实文件路径，请使用复制导入');
   }
   return result;
+}
+
+export async function openExternalModelUri(uri: string): Promise<ExternalModelResolveResult> {
+  return resolveExternalModelUri(uri);
 }
 
 export async function closeExternalModelUri(uri?: string): Promise<void> {
