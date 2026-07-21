@@ -2,12 +2,18 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { initLlama, LlamaContext, releaseAllLlama } from 'llama.rn';
 import { AIModel, InferenceParams } from '../types';
-import { closeAllExternalModelUris, closeExternalModelUri, openExternalModelUri } from './external-model-file';
+import {
+  closeAllExternalModelUris,
+  closeExternalModelUri,
+  resolveExternalModelUri,
+} from './external-model-file';
+import {
+  getRuntimeMemorySnapshot,
+  RuntimeMemorySnapshot,
+} from './runtime-memory';
 
 const MODELS_DIR = `${FileSystem.documentDirectory}ai-models/`;
-const BUILD20_MODEL_IMPORT_READY = true;
 const CONFLICTING_TOOL_STOPS = new Set(['{"t":', '```json']);
-const BUILD41_EXTERNAL_MODEL_REFERENCE = true;
 export type ModelImportMode = 'external' | 'copy';
 
 export interface InferenceDiagnostics {
@@ -21,16 +27,22 @@ export interface InferenceDiagnostics {
   callbackEvents: number;
   callbackCharacters: number;
   deduplicatedFinalUserMessage: boolean;
+  memoryGuardTriggered: boolean;
+  lastMemorySnapshot?: RuntimeMemorySnapshot;
 }
+
+let _activeContext: LlamaContext | null = null;
+let _activeModelId: string | null = null;
+let _completionInFlight = 0;
+let _lastDiagnostics: InferenceDiagnostics | null = null;
+let _activeExternalUri: string | null = null;
+let _activeInferenceParams: InferenceParams | null = null;
 
 export async function ensureModelsDir(): Promise<void> {
   const info = await FileSystem.getInfoAsync(MODELS_DIR);
-  if (!info.exists) {
-    await FileSystem.makeDirectoryAsync(MODELS_DIR, { intermediates: true });
-  }
+  if (!info.exists) await FileSystem.makeDirectoryAsync(MODELS_DIR, { intermediates: true });
 }
 
-/** 格式化文件大小 */
 export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -38,7 +50,10 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-/** 从文件选择器导入或直接引用 GGUF 模型 */
+/**
+ * 直接使用原文件只接受能解析为真实本机文件路径的 URI。content:// 代理流、
+ * 网盘和不可 mmap 的提供方会在导入阶段失败，避免“导入成功、加载失败”。
+ */
 export async function pickAndImportModel(mode: ModelImportMode = 'external'): Promise<AIModel | null> {
   const result = await DocumentPicker.getDocumentAsync({
     type: '*/*',
@@ -54,19 +69,16 @@ export async function pickAndImportModel(mode: ModelImportMode = 'external'): Pr
 
   const modelId = `model_${Date.now()}`;
   if (mode === 'external') {
-    let fileSize = asset.size ?? 0;
-    if (fileSize <= 0 && sourceUri.startsWith('file://')) {
-      const info = await FileSystem.getInfoAsync(sourceUri);
-      fileSize = (info as { size?: number }).size ?? 0;
-    }
+    const resolved = await resolveExternalModelUri(sourceUri);
+    const fileSize = resolved.size > 0 ? resolved.size : (asset.size ?? 0);
     return {
       id: modelId,
       name: fileName.replace(/\.gguf$/i, ''),
-      filePath: sourceUri,
+      filePath: resolved.path,
       sourceUri,
       storageMode: 'external',
       fileSize,
-      fileSizeLabel: fileSize > 0 ? formatFileSize(fileSize) : '大小将在加载时确认',
+      fileSizeLabel: fileSize > 0 ? formatFileSize(fileSize) : '大小未知',
       format: 'gguf',
       addedAt: Date.now(),
       isLoaded: false,
@@ -100,7 +112,6 @@ export async function pickAndImportModel(mode: ModelImportMode = 'external'): Pr
   };
 }
 
-/** 删除模型文件 */
 export async function deleteModelFile(model: AIModel): Promise<void> {
   if (_completionInFlight > 0) {
     throw new Error('模型正在生成内容，不能删除。请等待生成结束后重试。');
@@ -111,14 +122,6 @@ export async function deleteModelFile(model: AIModel): Promise<void> {
   }
   await FileSystem.deleteAsync(model.filePath, { idempotent: true });
 }
-
-// ─── llama.rn Context Management ─────────────────────────────────────────────
-
-let _activeContext: LlamaContext | null = null;
-let _activeModelId: string | null = null;
-let _completionInFlight = 0;
-let _lastDiagnostics: InferenceDiagnostics | null = null;
-let _activeExternalUri: string | null = null;
 
 export function getActiveContext(): LlamaContext | null {
   return _activeContext;
@@ -136,8 +139,16 @@ export function getLastInferenceDiagnostics(): InferenceDiagnostics | null {
   return _lastDiagnostics;
 }
 
-function formatRate(value: unknown): string {
-  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '未知';
+async function shouldStopForMemoryPressure(
+  params: InferenceParams,
+  snapshot: RuntimeMemorySnapshot | null
+): Promise<{ stop: boolean; reserveMb: number }> {
+  if (!params.memory_guard_enabled || !snapshot) return { stop: false, reserveMb: 0 };
+  const reserveMb = Math.max(params.memory_guard_reserve_mb, snapshot.thresholdMb * 1.25);
+  return {
+    stop: snapshot.lowMemory || snapshot.availMemMb < reserveMb,
+    reserveMb,
+  };
 }
 
 function installCompletionGuard(context: LlamaContext): LlamaContext {
@@ -148,27 +159,35 @@ function installCompletionGuard(context: LlamaContext): LlamaContext {
     params: Parameters<CompletionFn>[0],
     callback?: Parameters<CompletionFn>[1]
   ) => {
-    if (_completionInFlight > 0) {
-      throw new Error('已有推理任务正在运行，请等待当前生成结束');
+    if (_completionInFlight > 0) throw new Error('已有推理任务正在运行，请等待当前生成结束');
+
+    const activeParams = _activeInferenceParams;
+    if (!activeParams) throw new Error('推理参数状态丢失，请重新加载模型');
+
+    const preflight = await getRuntimeMemorySnapshot().catch(() => null);
+    const preflightDecision = await shouldStopForMemoryPressure(activeParams, preflight);
+    if (preflightDecision.stop && preflight) {
+      throw new Error(
+        `系统可用内存仅 ${preflight.availMemMb.toFixed(0)} MB，低于安全保留值 ${preflightDecision.reserveMb.toFixed(0)} MB。请先关闭其他大型应用、降低上下文或重新加载低内存参数。`
+      );
     }
 
     const startedAt = Date.now();
     let callbackEvents = 0;
     let callbackCharacters = 0;
     let deduplicatedFinalUserMessage = false;
+    let memoryGuardTriggered = false;
+    let lastMemorySnapshot = preflight ?? undefined;
+    let polling = false;
 
     const safeParams = { ...params } as typeof params & {
       stop?: string[];
       messages?: Array<{ role: string; content?: unknown }>;
     };
-
-    // 项目原先把工具 JSON 的开头本身设为 stop，导致模型刚开始调用工具就被截断。
     safeParams.stop = (safeParams.stop ?? []).filter(
       (stop) => typeof stop === 'string' && stop.length > 0 && !CONFLICTING_TOOL_STOPS.has(stop)
     );
 
-    // 聊天页先把用户消息写入 store，随后又追加一次相同 userText。
-    // 在原生推理入口统一移除末尾连续重复的用户消息，避免 prompt 重复。
     const messages = safeParams.messages;
     if (Array.isArray(messages) && messages.length >= 2) {
       const last = messages[messages.length - 1];
@@ -192,6 +211,27 @@ function installCompletionGuard(context: LlamaContext): LlamaContext {
           callback(data);
         })
       : undefined;
+
+    const pollMemory = async () => {
+      if (polling || memoryGuardTriggered || !activeParams.memory_guard_enabled) return;
+      polling = true;
+      try {
+        const snapshot = await getRuntimeMemorySnapshot();
+        if (!snapshot) return;
+        lastMemorySnapshot = snapshot;
+        const decision = await shouldStopForMemoryPressure(activeParams, snapshot);
+        if (decision.stop) {
+          memoryGuardTriggered = true;
+          await context.stopCompletion().catch(() => {});
+        }
+      } finally {
+        polling = false;
+      }
+    };
+
+    const memoryTimer = activeParams.memory_guard_enabled
+      ? setInterval(() => { void pollMemory(); }, 1200)
+      : null;
 
     _completionInFlight += 1;
     try {
@@ -217,20 +257,19 @@ function installCompletionGuard(context: LlamaContext): LlamaContext {
         callbackEvents,
         callbackCharacters,
         deduplicatedFinalUserMessage,
+        memoryGuardTriggered,
+        lastMemorySnapshot,
       };
 
-      if (callback) {
-        const summary =
-          `\n\n[性能诊断] Prefill ${formatRate(timings?.prompt_per_second)} tok/s` +
-          `；Decode ${formatRate(timings?.predicted_per_second)} tok/s` +
-          `；原生输出 ${timings?.predicted_n ?? '未知'} tokens` +
-          `；耗时 ${((finishedAt - startedAt) / 1000).toFixed(2)}s` +
-          `${deduplicatedFinalUserMessage ? '；已去除重复用户消息' : ''}`;
-        callback({ token: summary } as Parameters<NonNullable<typeof callback>>[0]);
+      if (memoryGuardTriggered) {
+        const available = lastMemorySnapshot?.availMemMb;
+        throw new Error(
+          `内存保护已主动停止生成${available ? `：系统可用内存降至 ${available.toFixed(0)} MB` : ''}。已生成的内容已保留；请降低上下文、batch、KV 缓存精度或关闭其他应用后继续。`
+        );
       }
-
       return result;
     } finally {
+      if (memoryTimer) clearInterval(memoryTimer);
       _completionInFlight = Math.max(0, _completionInFlight - 1);
     }
   }) as CompletionFn;
@@ -238,7 +277,6 @@ function installCompletionGuard(context: LlamaContext): LlamaContext {
   return context;
 }
 
-/** 加载模型。外部模型通过持久化 SAF 文件描述符直接映射，不复制权重。 */
 export async function loadModel(
   model: AIModel,
   params: InferenceParams,
@@ -255,12 +293,13 @@ export async function loadModel(
     _activeExternalUri = null;
   }
   _activeModelId = null;
+  _activeInferenceParams = null;
 
   let resolvedPath = model.filePath;
   const externalUri = model.storageMode === 'external' ? (model.sourceUri ?? model.filePath) : null;
   if (externalUri) {
-    const opened = await openExternalModelUri(externalUri);
-    resolvedPath = opened.path.startsWith('/') ? `file://${opened.path}` : opened.path;
+    const resolved = await resolveExternalModelUri(externalUri);
+    resolvedPath = resolved.path;
   }
 
   try {
@@ -274,12 +313,17 @@ export async function loadModel(
         n_gpu_layers: params.n_gpu_layers,
         use_mlock: params.use_mlock,
         use_mmap: params.use_mmap,
+        cache_type_k: params.cache_type_k,
+        cache_type_v: params.cache_type_v,
         n_parallel: 1,
         kv_unified: true,
-        no_extra_bufts: true,
+        no_extra_bufts: params.no_extra_bufts,
+        flash_attn_type: params.n_gpu_layers > 0 ? 'auto' : 'off',
+        swa_full: false,
       } as Parameters<typeof initLlama>[0],
       (progress) => onProgress?.(progress)
     );
+    _activeInferenceParams = { ...params };
     _activeContext = installCompletionGuard(context);
     _activeModelId = model.id;
     _activeExternalUri = externalUri;
@@ -289,11 +333,12 @@ export async function loadModel(
     if (externalUri) await closeExternalModelUri(externalUri);
     _activeExternalUri = null;
     _activeModelId = null;
-    throw error;
+    _activeInferenceParams = null;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`模型加载失败：${detail}`);
   }
 }
 
-/** 释放当前模型 */
 export async function releaseModel(): Promise<void> {
   if (_completionInFlight > 0) {
     throw new Error('模型正在生成内容，不能卸载。请等待生成结束后重试。');
@@ -301,23 +346,22 @@ export async function releaseModel(): Promise<void> {
   if (_activeContext) {
     await _activeContext.release();
     _activeContext = null;
-    _activeModelId = null;
   }
   if (_activeExternalUri) {
     await closeExternalModelUri(_activeExternalUri);
     _activeExternalUri = null;
   }
+  _activeModelId = null;
+  _activeInferenceParams = null;
 }
 
-/** 释放所有 llama.rn 上下文 */
 export async function releaseAll(): Promise<void> {
-  if (_completionInFlight > 0) {
-    throw new Error('模型正在生成内容，不能释放全部上下文');
-  }
+  if (_completionInFlight > 0) throw new Error('模型正在生成内容，不能释放全部上下文');
   await releaseAllLlama();
   await closeAllExternalModelUris();
   _activeContext = null;
   _activeModelId = null;
   _activeExternalUri = null;
+  _activeInferenceParams = null;
   _lastDiagnostics = null;
 }
