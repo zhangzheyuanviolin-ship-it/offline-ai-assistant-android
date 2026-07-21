@@ -86,14 +86,15 @@ class ExternalModelFileModule(
         )
         persisted = true
       } catch (_: SecurityException) {
-        // Some providers grant only session access. The descriptor remains valid for this load.
+        // Some providers grant only session access. The descriptor remains valid while retained below.
       }
 
       val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
         ?: throw IllegalStateException("Unable to open selected model file")
-      val fd = descriptor.fd
+      val rawFd = descriptor.fd
+      val fileDescriptor = descriptor.fileDescriptor
       val seekable = try {
-        Os.lseek(fd, 0L, OsConstants.SEEK_CUR)
+        Os.lseek(fileDescriptor, 0L, OsConstants.SEEK_CUR)
         true
       } catch (_: Exception) {
         false
@@ -106,13 +107,13 @@ class ExternalModelFileModule(
       handles.remove(uriString)?.close()
       handles[uriString] = descriptor
       val size = if (descriptor.statSize >= 0L) descriptor.statSize else try {
-        Os.fstat(fd).st_size
+        Os.fstat(fileDescriptor).st_size
       } catch (_: Exception) {
         -1L
       }
 
       val result = Arguments.createMap()
-      result.putString("path", "/proc/self/fd/\$fd")
+      result.putString("path", "/proc/self/fd/\$rawFd")
       result.putDouble("size", size.toDouble())
       result.putBoolean("seekable", true)
       result.putBoolean("persisted", persisted)
@@ -153,7 +154,6 @@ import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.uimanager.ViewManager
-import com.facebook.react.uimanager.ViewManagerDelegate
 
 class ExternalModelFilePackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
