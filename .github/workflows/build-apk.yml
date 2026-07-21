@@ -72,6 +72,22 @@ jobs:
             tail -160 build41-patch.log > build41-patch-error.txt
             exit $status
           fi
+          python3 - << 'PYEOF'
+          import re
+          index_path = 'app/(tabs)/index.tsx'
+          index = open(index_path, 'r', encoding='utf-8').read()
+          index = re.sub(r'^\s*pusher\.(?:cancel|flush)\(\);\s*\n', '', index, flags=re.M)
+          index = re.sub(r"^\s*setStreamContent\(''\);\s*\n", '', index, flags=re.M)
+          open(index_path, 'w', encoding='utf-8').write(index)
+
+          model_path = 'lib/services/model-service.ts'
+          model = open(model_path, 'r', encoding='utf-8').read()
+          model = model.replace(
+              'messages?: Array<{ role: string; content: unknown }>;',
+              'messages?: Array<{ role: string; content?: unknown }>;'
+          )
+          open(model_path, 'w', encoding='utf-8').write(model)
+          PYEOF
 
       - name: Upload build41 patch error
         if: failure() && steps.build41_patch.outcome == 'failure'
@@ -91,7 +107,7 @@ jobs:
           grep -F "activeModelId: nativeModelId," "lib/store.ts"
           grep -F "内存映射 (mmap)" "app/(tabs)/settings.tsx"
           grep -F "直接引用（推荐大模型）" "app/(tabs)/models.tsx"
-          if grep -E "本轮已生成|MAX_TOOL_ROUNDS|createPushToken" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
+          if grep -E "本轮已生成|MAX_TOOL_ROUNDS|createPushToken|pusher\.|setStreamContent" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
             echo "Catastrophic cumulative streaming or fixed tool cap remains" >&2
             exit 1
           fi
