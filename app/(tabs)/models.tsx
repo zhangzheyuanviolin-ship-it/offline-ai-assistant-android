@@ -18,6 +18,10 @@ import {
   pickAndImportModel,
   releaseModel,
 } from '@/lib/services/model-service';
+import {
+  hasDirectModelFileAccess,
+  requestDirectModelFileAccess,
+} from '@/lib/services/external-model-file';
 import { AIModel } from '@/lib/types';
 
 export default function ModelsScreen() {
@@ -46,6 +50,18 @@ export default function ModelsScreen() {
   const performImport = useCallback(async (mode: ModelImportMode) => {
     setIsImporting(true);
     try {
+      if (mode === 'external') {
+        const allowed = await hasDirectModelFileAccess();
+        if (!allowed) {
+          await requestDirectModelFileAccess();
+          Alert.alert(
+            '需要系统授权',
+            '系统设置已经打开。请允许此应用访问所有文件，然后返回模型页面，再次选择“直接使用本机原文件”。这个权限只用于让 llama.rn 通过真实路径 mmap 您主动选择的 GGUF 文件。'
+          );
+          return;
+        }
+      }
+
       const model = await pickAndImportModel(mode);
       if (!model) return;
       addModel(model);
@@ -70,7 +86,7 @@ export default function ModelsScreen() {
   const handleImport = useCallback(() => {
     Alert.alert(
       '选择模型文件使用方式',
-      '“直接使用原文件”只接受本机内部存储或 SD 卡中能够解析为真实路径的 GGUF；网盘、代理文件和只提供 content 流的来源必须复制到应用目录。',
+      '直接使用原文件不会产生第二份 GGUF，但需要“所有文件访问权限”，并且文件必须位于本机内部存储或 SD 卡。网盘和代理文件必须复制到应用目录。',
       [
         { text: '直接使用本机原文件', onPress: () => performImport('external') },
         { text: '复制到应用目录', onPress: () => performImport('copy') },
@@ -92,7 +108,7 @@ export default function ModelsScreen() {
       syncModelLoadedState();
       Alert.alert(
         '加载成功',
-        `模型“${model.name}”已加载。当前参数：上下文 ${inferenceParams.n_ctx}，batch ${inferenceParams.n_batch}，ubatch ${inferenceParams.n_ubatch}，KV ${inferenceParams.cache_type_k}/${inferenceParams.cache_type_v}。`
+        `模型“${model.name}”已加载。上下文 ${inferenceParams.n_ctx}，batch ${inferenceParams.n_batch}，ubatch ${inferenceParams.n_ubatch}，KV ${inferenceParams.cache_type_k}/${inferenceParams.cache_type_v}。`
       );
     } catch (error) {
       syncModelLoadedState();
@@ -167,11 +183,7 @@ export default function ModelsScreen() {
         accessible={false}
       >
         <View style={styles.modelInfo} accessible={false}>
-          <Text
-            style={[styles.modelName, { color: colors.foreground }]}
-            accessibilityRole="header"
-            accessible
-          >
+          <Text style={[styles.modelName, { color: colors.foreground }]} accessibilityRole="header">
             {item.name}
           </Text>
           <Text
