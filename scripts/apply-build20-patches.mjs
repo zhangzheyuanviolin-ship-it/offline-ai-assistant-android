@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 
 function read(path) { return fs.readFileSync(path, 'utf8'); }
-function write(path, content) { fs.writeFileSync(path, content, 'utf8'); console.log(`[build20] patched ${path}`); }
+function write(path, content) { fs.writeFileSync(path, content, 'utf8'); console.log(`[build21] patched ${path}`); }
 function mustReplace(content, search, replacement, label) {
   if (content.includes(replacement)) return content;
-  if (!content.includes(search)) throw new Error(`[build20] target not found: ${label}`);
+  if (!content.includes(search)) throw new Error(`[build21] target not found: ${label}`);
   return content.replace(search, replacement);
 }
 
@@ -14,7 +14,7 @@ function patchToolsService() {
   if (content.includes('BUILD20_TOOLS_READY')) return;
   const start = content.indexOf('export function parseToolCalls(text: string): ParsedToolCall[] {');
   const end = content.indexOf('// ─── Tool Helpers', start);
-  if (start < 0 || end < 0) throw new Error('[build20] parser block not found');
+  if (start < 0 || end < 0) throw new Error('[build21] parser block not found');
   const block = `const BUILD20_TOOLS_READY = true;
 
 function extractBalancedJsonObjects(text: string): string[] {
@@ -100,13 +100,32 @@ function patchChat() {
   const path = 'app/(tabs)/index.tsx';
   let content = read(path);
   if (content.includes('BUILD20_CHAT_READY')) return;
-  content = mustReplace(content, '  buildCompactSystemPrompt,\n', '  buildCompactSystemPrompt,\n  buildNativeTools,\n', 'tool import');
+
   content = mustReplace(
     content,
-    '  const toolPrompt = buildCompactSystemPrompt(toolsConfig);\n  const systemContent = `你是一个离线 AI 助手，运行在用户手机上。简洁回答，必要时调用工具。${toolPrompt}`;',
-    "  const nativeTools = buildNativeTools(toolsConfig);\n  const toolPrompt = nativeTools.length === 0 ? '' : '\\n需要外部信息或文件操作时调用工具，不要伪造工具结果。';\n  const systemContent = `你是一个离线 AI 助手，运行在用户手机上。简洁回答，必要时调用工具。${toolPrompt}`;",
-    'system prompt'
+    '  buildCompactSystemPrompt,\n',
+    '  buildCompactSystemPrompt,\n  buildNativeTools,\n',
+    'tool import'
   );
+
+  // Define nativeTools inside runInference before any completion round uses it.
+  // build33 replaced the completion arguments but skipped the old two-line prompt target,
+  // leaving an undeclared identifier that Hermes reported as "Property nativeTools doesn't exist".
+  content = mustReplace(
+    content,
+    '  const ctx = getActiveContext();\n',
+    '  const ctx = getActiveContext();\n  const nativeTools = buildNativeTools(toolsConfig);\n',
+    'nativeTools declaration'
+  );
+
+  // Keep the system prompt tiny. Complex defaults remain in the app settings, not model arguments.
+  content = mustReplace(
+    content,
+    '  const toolPrompt = buildCompactSystemPrompt(toolsConfig);\n',
+    "  const toolPrompt = nativeTools.length === 0 ? '' : '\\n需要外部信息或文件操作时调用工具，不要伪造工具结果。';\n",
+    'minimal tool prompt'
+  );
+
   content = mustReplace(content, '    await ctx.completion(\n', '    const completionResult = await ctx.completion(\n', 'completion result binding');
   content = mustReplace(
     content,
@@ -116,7 +135,7 @@ function patchChat() {
   );
   content = mustReplace(
     content,
-    '      },\n      (data: { token: string }) => {\n        const tok = data.token ?? \'\';',
+    "      },\n      (data: { token: string }) => {\n        const tok = data.token ?? '';",
     "      } as Parameters<typeof ctx.completion>[0] & { tools?: Array<Record<string, unknown>>; tool_choice?: 'auto' },\n      (data: { token?: string; content?: string; reasoning_content?: string }) => {\n        const tok = data.token ?? data.content ?? data.reasoning_content ?? '';",
     'native callback fields'
   );
@@ -144,9 +163,10 @@ function patchChat() {
     fullResponse = fullResponse.replace(/<\\/?tool_call>/g, '').trimEnd();`,
     'tool call extraction'
   );
+
   const pStart = content.indexOf('interface ParsedContent {');
   const pEnd = content.indexOf('// ─── Activity Message', pStart);
-  if (pStart < 0 || pEnd < 0) throw new Error('[build20] thinking parser block not found');
+  if (pStart < 0 || pEnd < 0) throw new Error('[build21] thinking parser block not found');
   const parser = `const BUILD20_CHAT_READY = true;
 
 interface ParsedContent { thinking: string; response: string; }
@@ -191,7 +211,28 @@ function patchModelImport() {
   write(path, content);
 }
 
+function validatePatchedSources() {
+  const chat = read('app/(tabs)/index.tsx');
+  const tools = read('lib/services/tools-service.ts');
+  const model = read('lib/services/model-service.ts');
+  const checks = [
+    ['buildNativeTools import', chat.includes('  buildNativeTools,')],
+    ['nativeTools declaration', chat.includes('const nativeTools = buildNativeTools(toolsConfig);')],
+    ['nativeTools completion argument', chat.includes('tools: nativeTools,')],
+    ['completion result binding', chat.includes('const completionResult = await ctx.completion(')],
+    ['balanced tool parser', tools.includes('function extractBalancedJsonObjects')],
+    ['native tool builder export', tools.includes('export function buildNativeTools')],
+    ['single-copy model picker', model.includes('copyToCacheDirectory: false')],
+  ];
+  const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
+  if (failed.length > 0) throw new Error(`[build21] validation failed: ${failed.join(', ')}`);
+  const declarationCount = chat.split('const nativeTools = buildNativeTools(toolsConfig);').length - 1;
+  if (declarationCount !== 1) throw new Error(`[build21] nativeTools declaration count is ${declarationCount}, expected 1`);
+  console.log('[build21] runtime patch validation passed');
+}
+
 patchToolsService();
 patchChat();
 patchModelImport();
-console.log('[build20] all patches applied');
+validatePatchedSources();
+console.log('[build21] all patches applied');
