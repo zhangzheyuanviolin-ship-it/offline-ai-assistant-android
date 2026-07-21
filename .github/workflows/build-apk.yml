@@ -45,7 +45,33 @@ jobs:
         run: pnpm build20:patch
 
       - name: Apply build22 runtime patches
-        run: node scripts/apply-build22-patches.mjs
+        id: build22_patch
+        run: |
+          python3 - << 'PYEOF'
+          path = 'scripts/apply-build22-patches.mjs'
+          content = open(path, 'r', encoding='utf-8').read()
+          content = content.replace(
+              'return content.slice(0, startIndex) + replacement + content.slice(endIndex);',
+              'return content.slice(0, startIndex) + replacement + content.slice(endIndex + end.length);'
+          )
+          open(path, 'w', encoding='utf-8').write(content)
+          PYEOF
+          set +e
+          node scripts/apply-build22-patches.mjs > build22-patch.log 2>&1
+          status=$?
+          cat build22-patch.log
+          if [ $status -ne 0 ]; then
+            tail -120 build22-patch.log > build22-patch-error.txt
+            exit $status
+          fi
+
+      - name: Upload build22 patch error
+        if: failure() && steps.build22_patch.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build22-patch-error
+          path: build22-patch-error.txt
+          retention-days: 7
 
       - name: Validate build22 critical paths
         run: |
@@ -60,7 +86,7 @@ jobs:
             echo "Performance diagnostics still contaminate model output" >&2
             exit 1
           fi
-          if grep -F "accessible accessibilityLabel={`AI：${response || content || activityText}`}" "app/(tabs)/index.tsx"; then
+          if grep -F 'accessible accessibilityLabel={`AI：${response || content || activityText}`}' "app/(tabs)/index.tsx"; then
             echo "Streaming thinking control is still grouped into one accessibility node" >&2
             exit 1
           fi
