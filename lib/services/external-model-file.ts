@@ -13,9 +13,23 @@ interface ExternalModelFileNativeModule {
   open(uri: string): Promise<ExternalModelResolveResult>;
   close(uri: string): Promise<void>;
   closeAll(): Promise<void>;
+  hasAllFilesAccess(): Promise<boolean>;
+  requestAllFilesAccess(): Promise<boolean>;
 }
 
 const nativeModule = NativeModules.ExternalModelFile as ExternalModelFileNativeModule | undefined;
+
+export async function hasDirectModelFileAccess(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
+  if (!nativeModule) return false;
+  return nativeModule.hasAllFilesAccess();
+}
+
+export async function requestDirectModelFileAccess(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
+  if (!nativeModule) throw new Error('外部模型路径解析模块未加载');
+  return nativeModule.requestAllFilesAccess();
+}
 
 export async function resolveExternalModelUri(uri: string): Promise<ExternalModelResolveResult> {
   if (uri.startsWith('file://')) {
