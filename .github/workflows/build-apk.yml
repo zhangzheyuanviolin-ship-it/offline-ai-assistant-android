@@ -47,6 +47,23 @@ jobs:
       - name: Apply build41 sustainable architecture
         id: build41_patch
         run: |
+          python3 - << 'PYEOF'
+          path = 'scripts/apply-build41-patches.mjs'
+          content = open(path, 'r', encoding='utf-8').read()
+          content = content.replace(
+              'return content.slice(0, startIndex) + replacement + content.slice(endIndex);',
+              'return content.slice(0, startIndex) + replacement + content.slice(endIndex + end.length);'
+          )
+          content = content.replace(
+              "const pusherStart = '  // 创建 token 推送器';",
+              "const pusherStart = '  const createPushToken = useCallback(() => {';"
+          )
+          content = content.replace(
+              "const pusherEnd = '  // 发送消息';",
+              "const pusherEnd = '  const handleSend = useCallback(async () => {';"
+          )
+          open(path, 'w', encoding='utf-8').write(content)
+          PYEOF
           set +e
           node scripts/apply-build41-patches.mjs > build41-patch.log 2>&1
           status=$?
