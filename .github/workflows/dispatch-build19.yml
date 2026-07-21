@@ -1,4 +1,4 @@
-name: Dispatch build19 APK
+name: Dispatch APK build from PR
 
 on:
   pull_request:
@@ -15,15 +15,16 @@ jobs:
       - name: Dispatch signed APK workflow
         env:
           GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           gh workflow run build-apk.yml \
             --repo zhangzheyuanviolin-ship-it/offline-ai-assistant-android \
-            --ref agent/build19-diagnostics-stability \
+            --ref "$HEAD_REF" \
             -f version_name=1.0.0
           sleep 10
           gh run list \
             --repo zhangzheyuanviolin-ship-it/offline-ai-assistant-android \
             --workflow build-apk.yml \
-            --branch agent/build19-diagnostics-stability \
+            --branch "$HEAD_REF" \
             --limit 1 \
             --json databaseId,status,conclusion,url,headSha,event
