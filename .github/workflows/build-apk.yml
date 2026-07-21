@@ -41,14 +41,29 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply and validate build21 source patches
+      - name: Apply build21 base patches
         run: pnpm build20:patch
 
-      - name: Verify nativeTools runtime scope
+      - name: Apply build22 runtime patches
+        run: node scripts/apply-build22-patches.mjs
+
+      - name: Validate build22 critical paths
         run: |
-          grep -F "const nativeTools = buildNativeTools(toolsConfig);" "app/(tabs)/index.tsx"
-          grep -F "tools: nativeTools," "app/(tabs)/index.tsx"
-          grep -F "export function buildNativeTools" "lib/services/tools-service.ts"
+          grep -F "const configuredNativeTools = buildNativeTools(toolsConfig);" "app/(tabs)/index.tsx"
+          grep -F "const BUILD22_TOOL_LOOP_READY = true;" "app/(tabs)/index.tsx"
+          grep -F "formatToolResultForModel" "app/(tabs)/index.tsx"
+          grep -F "BUILD22_SEARCH_RESULTS_READY" "lib/services/tools-service.ts"
+          grep -F "BUILD22_LARGE_MODEL_SAFE_PROFILE" "lib/services/model-service.ts"
+          grep -F "n_ubatch" "app/(tabs)/settings.tsx"
+          grep -F "large_model_safe_mode" "lib/types.ts"
+          if grep -F "callback({ token: summary }" "lib/services/model-service.ts"; then
+            echo "Performance diagnostics still contaminate model output" >&2
+            exit 1
+          fi
+          if grep -F "accessible accessibilityLabel={`AI：${response || content || activityText}`}" "app/(tabs)/index.tsx"; then
+            echo "Streaming thinking control is still grouped into one accessibility node" >&2
+            exit 1
+          fi
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -137,11 +152,13 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant build21 runtime-fix release
-            - Fixes the Hermes runtime error: Property 'nativeTools' doesn't exist.
-            - Verifies nativeTools is declared inside runInference before APK compilation.
-            - Keeps compact native llama.rn tool schemas and balanced-JSON fallback parsing.
-            - Keeps Qwen thinking separation and single-copy GGUF import.
+            ## Offline AI Assistant build22 test release
+            - Keeps performance diagnostics out of model text and tool results.
+            - Parses DuckDuckGo result titles, decoded links, and snippets; rejects template placeholders.
+            - Prevents repeated identical tool calls and keeps only the final answer.
+            - Fixes independent expand/collapse controls for thinking content.
+            - Adds mmap, mlock, n_ubatch, and large-model safe mode settings.
+            - Applies conservative CPU/KV/batch settings to model files larger than 12 GB.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
