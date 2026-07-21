@@ -91,7 +91,7 @@ class ExternalModelFileModule(
 
       val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
         ?: throw IllegalStateException("Unable to open selected model file")
-      val rawFd = descriptor.fd
+      val fd = descriptor.fd
       val fileDescriptor = descriptor.fileDescriptor
       val seekable = try {
         Os.lseek(fileDescriptor, 0L, OsConstants.SEEK_CUR)
@@ -113,7 +113,7 @@ class ExternalModelFileModule(
       }
 
       val result = Arguments.createMap()
-      result.putString("path", "/proc/self/fd/\$rawFd")
+      result.putString("path", "/proc/self/fd/\$fd")
       result.putDouble("size", size.toDouble())
       result.putBoolean("seekable", true)
       result.putBoolean("persisted", persisted)
