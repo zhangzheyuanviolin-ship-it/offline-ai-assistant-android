@@ -2,6 +2,7 @@ import React, { useCallback } from 'react';
 import {
   Alert,
   ScrollView,
+  Switch,
   StyleSheet,
   Text,
   TextInput,
@@ -119,6 +120,33 @@ function ParamRow({
   );
 }
 
+const BUILD41_MEMORY_SETTINGS = true;
+
+function ToggleRow({ label, description, value, onChange, colors }: {
+  label: string;
+  description: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+  colors: ReturnType<typeof useColors>;
+}) {
+  return (
+    <View style={[styles.paramRow, { borderBottomColor: colors.border }]} accessible={false}>
+      <View style={styles.paramInfo} accessible={false}>
+        <Text style={[styles.paramLabel, { color: colors.foreground }]}>{label}</Text>
+        <Text style={[styles.paramDesc, { color: colors.muted }]}>{description}</Text>
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onChange}
+        accessible
+        accessibilityRole="switch"
+        accessibilityLabel={`${label}，当前${value ? '开启' : '关闭'}`}
+        accessibilityState={{ checked: value }}
+      />
+    </View>
+  );
+}
+
 // ─── Settings Screen ──────────────────────────────────────────────────────────
 
 export default function SettingsScreen() {
@@ -128,8 +156,8 @@ export default function SettingsScreen() {
   const activeModel = useAppStore(selectActiveModel);
 
   const update = useCallback(
-    (key: keyof InferenceParams, value: number) => {
-      setInferenceParams({ [key]: value });
+    <K extends keyof InferenceParams,>(key: K, value: InferenceParams[K]) => {
+      setInferenceParams({ [key]: value } as Partial<InferenceParams>);
     },
     [setInferenceParams]
   );
@@ -143,6 +171,23 @@ export default function SettingsScreen() {
           setInferenceParams(DEFAULT_INFERENCE_PARAMS);
           Alert.alert('已重置', '推理参数已恢复为默认值');
         },
+      },
+    ]);
+  };
+
+  const applyMoEPreset = () => {
+    Alert.alert('应用 30B MoE 低内存预设', '将上下文设为 2048、batch 64、ubatch 32、纯 CPU、开启 mmap、关闭 mlock。参数仍可继续手动修改。', [
+      { text: '取消', style: 'cancel' },
+      {
+        text: '应用',
+        onPress: () => setInferenceParams({
+          n_ctx: 2048,
+          n_batch: 64,
+          n_ubatch: 32,
+          n_gpu_layers: 0,
+          use_mmap: true,
+          use_mlock: false,
+        }),
       },
     ]);
   };
@@ -218,7 +263,45 @@ export default function SettingsScreen() {
             onChange={(v) => update('n_batch', v)}
             colors={colors}
           />
+
+          <ParamRow
+            label="微批处理大小 (n_ubatch)"
+            description="控制单次计算临时缓冲；大模型可尝试 16、32 或 64"
+            value={params.n_ubatch}
+            min={1}
+            max={512}
+            step={16}
+            onChange={(v) => update('n_ubatch', v)}
+            colors={colors}
+          />
+
+          <ToggleRow
+            label="内存映射 (mmap)"
+            description="按需映射 GGUF 文件页面，通常建议开启，尤其是外部大模型"
+            value={params.use_mmap}
+            onChange={(v) => update('use_mmap', v)}
+            colors={colors}
+          />
+
+          <ToggleRow
+            label="内存锁定 (mlock)"
+            description="阻止模型页面被系统回收；十几 GB 模型通常应关闭"
+            value={params.use_mlock}
+            onChange={(v) => update('use_mlock', v)}
+            colors={colors}
+          />
         </View>
+
+        <TouchableOpacity
+          style={[styles.presetBtn, { borderColor: colors.primary }]}
+          onPress={applyMoEPreset}
+          accessible
+          accessibilityRole="button"
+          accessibilityLabel="应用 30B MoE 低内存预设"
+          accessibilityHint="双击设置上下文 2048、batch 64、ubatch 32、纯 CPU、开启内存映射并关闭内存锁定"
+        >
+          <Text style={[styles.presetBtnText, { color: colors.primary }]}>应用 30B MoE 低内存预设</Text>
+        </TouchableOpacity>
 
         {/* 硬件加速 */}
         <View style={[styles.section, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -363,6 +446,8 @@ const styles = StyleSheet.create({
   stepBtnText: { fontSize: 20, fontWeight: '600', lineHeight: 24 },
   valueBox: { flex: 1, height: 36, borderRadius: 8, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center', minWidth: 70 },
   valueText: { fontSize: 15, fontWeight: '700' },
+  presetBtn: { borderWidth: 1, borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
+  presetBtnText: { fontSize: 15, fontWeight: '600' },
   resetBtn: { paddingVertical: 14, borderRadius: 12, borderWidth: 1.5, alignItems: 'center' },
   resetBtnText: { fontSize: 16, fontWeight: '700' },
   infoBox: { borderRadius: 12, padding: 16, borderWidth: 1, gap: 8 },

@@ -16,6 +16,7 @@ import {
   deleteModelFile,
   loadModel,
   releaseModel,
+  ModelImportMode,
 } from '@/lib/services/model-service';
 import { AIModel } from '@/lib/types';
 
@@ -33,6 +34,7 @@ export default function ModelsScreen() {
     setActiveModel,
     setModelLoaded,
     loadModelsFromStorage,
+    syncModelLoadedState,
   } = useAppStore();
 
   const activeModel = useAppStore(selectActiveModel);
@@ -41,19 +43,39 @@ export default function ModelsScreen() {
     loadModelsFromStorage();
   }, []);
 
-  const handleImport = useCallback(async () => {
+  const performImport = useCallback(async (mode: ModelImportMode) => {
     setIsImporting(true);
     try {
-      const model = await pickAndImportModel();
+      const model = await pickAndImportModel(mode);
       if (!model) return;
       addModel(model);
-      Alert.alert('导入成功', `模型 "${model.name}" 已导入\n大小：${model.fileSizeLabel}`);
+      Alert.alert(
+        '导入成功',
+        mode === 'external'
+          ? `已直接引用模型“${model.name}”。模型权重不会复制到应用目录，加载时通过外部文件描述符按需映射。
+大小：${model.fileSizeLabel}`
+          : `模型“${model.name}”已复制到应用目录。
+大小：${model.fileSizeLabel}`
+      );
     } catch (err) {
       Alert.alert('导入失败', err instanceof Error ? err.message : '未知错误');
     } finally {
       setIsImporting(false);
     }
   }, [addModel]);
+
+  const BUILD41_IMPORT_CHOICES = true;
+  const handleImport = useCallback(() => {
+    Alert.alert(
+      '选择导入方式',
+      '直接引用不会复制模型，推荐用于十几 GB 的大模型；复制导入兼容不支持随机读取的文件提供方。',
+      [
+        { text: '直接引用（推荐大模型）', onPress: () => performImport('external') },
+        { text: '复制到应用', onPress: () => performImport('copy') },
+        { text: '取消', style: 'cancel' },
+      ]
+    );
+  }, [performImport]);
 
   const handleLoad = useCallback(
     async (model: AIModel) => {
@@ -66,14 +88,16 @@ export default function ModelsScreen() {
         });
         setModelLoaded(model.id, true);
         setActiveModel(model.id);
+        syncModelLoadedState();
         Alert.alert('加载成功', `模型 "${model.name}" 已加载到内存，可以开始对话`);
       } catch (err) {
+        syncModelLoadedState();
         Alert.alert('加载失败', err instanceof Error ? err.message : '加载模型时出错');
       } finally {
         setLoadingModelId(null);
       }
     },
-    [loadingModelId, inferenceParams, setModelLoaded, setActiveModel]
+    [loadingModelId, inferenceParams, setModelLoaded, setActiveModel, syncModelLoadedState]
   );
 
   const handleUnload = useCallback(async () => {
@@ -90,7 +114,9 @@ export default function ModelsScreen() {
     (model: AIModel) => {
       Alert.alert(
         '删除模型',
-        `确定要删除 "${model.name}" 吗？\n此操作不可撤销。`,
+        model.storageMode === 'external'
+          ? `确定从列表移除“${model.name}”吗？外部原文件不会被删除。`
+          : `确定要删除“${model.name}”吗？\n应用内模型副本将被永久删除。`,
         [
           { text: '取消', style: 'cancel' },
           {
@@ -117,7 +143,7 @@ export default function ModelsScreen() {
 
   const renderModel = useCallback(
     ({ item }: { item: AIModel }) => {
-      const isActive = item.id === activeModelId;
+      const isActive = item.id === activeModelId && item.isLoaded;
       const isLoading = item.id === loadingModelId;
 
       return (
@@ -143,7 +169,7 @@ export default function ModelsScreen() {
               {item.name}
             </Text>
             <Text style={[styles.modelMeta, { color: colors.muted }]}>
-              {item.fileSizeLabel} · GGUF · {isActive ? '✅ 已加载' : '⏳ 未加载'}
+              {item.fileSizeLabel} · GGUF · {item.storageMode === 'external' ? '外部直接引用' : '应用内副本'} · {isActive ? '✅ 已加载' : '⏳ 未加载'}
             </Text>
             <Text style={[styles.modelPath, { color: colors.muted }]} numberOfLines={1}>
               {item.filePath.split('/').pop()}

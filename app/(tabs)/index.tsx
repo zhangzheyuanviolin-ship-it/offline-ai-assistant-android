@@ -15,154 +15,29 @@ import {
 import { ScreenContainer } from '@/components/screen-container';
 import { useColors } from '@/hooks/use-colors';
 import { useAppStore, selectActiveModel } from '@/lib/store';
-import { getActiveContext } from '@/lib/services/model-service';
-import {
-  buildCompactSystemPrompt,
-  executeTool,
-  getToolCategory,
-  parseToolCalls,
-  toolRequiresConfirmation,
-} from '@/lib/services/tools-service';
+import { runInferenceOrchestrator } from '@/lib/services/inference-orchestrator';
+import { AccessibilityChunkedText } from '@/components/accessibility-chunked-text';
+import { executeTool, formatToolResultForModel, toolRequiresConfirmation } from '@/lib/services/tools-service';
 import { ChatMessage, ToolCall, ToolLog } from '@/lib/types';
 import { ToolConfirmationModal } from '@/components/tool-confirmation-modal';
 import { router } from 'expo-router';
 
-// ─── Inference Engine ─────────────────────────────────────────────────────────
-
-async function runInference(
-  userText: string,
-  historySnapshot: ChatMessage[],
-  toolsConfig: ReturnType<typeof useAppStore.getState>['toolsConfig'],
-  inferenceParams: ReturnType<typeof useAppStore.getState>['inferenceParams'],
-  workspaceDir: string,
-  pushToken: (token: string) => void,
-  onToolCall: (call: ToolCall) => Promise<string>,
-  onActivity: (kind: 'thinking' | 'streaming' | 'tool_calling' | 'tool_done' | 'warning' | 'error', text: string) => void
-): Promise<string> {
-  const ctx = getActiveContext();
-  if (!ctx) throw new Error('\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684\u6a21\u578b\uff0c\u8bf7\u5148\u5728\u201c\u6a21\u578b\u201d\u9875\u9762\u52a0\u8f7d\u4e00\u4e2a GGUF \u6a21\u578b');
-
-  const toolPrompt = buildCompactSystemPrompt(toolsConfig);
-  const systemContent = `\u4f60\u662f\u4e00\u4e2a\u79bb\u7ebf AI \u52a9\u624b\uff0c\u8fd0\u884c\u5728\u7528\u6237\u624b\u673a\u4e0a\u3002\u7b80\u6d01\u56de\u7b54\uff0c\u5fc5\u8981\u65f6\u8c03\u7528\u5de5\u5177\u3002${toolPrompt}`;
-
-  const recentHistory = historySnapshot
-    .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .slice(-20);
-
-  const msgs: Array<{ role: string; content: string }> = [
-    { role: 'system', content: systemContent },
-    ...recentHistory.map((m) => ({ role: m.role as string, content: m.content })),
-    { role: 'user', content: userText },
-  ];
-
-  const safeStop = (inferenceParams.stop || []).filter((s) => typeof s === 'string' && s.length > 0);
-
-  let fullResponse = '';
-  let toolCallRound = 0;
-  const MAX_TOOL_ROUNDS = 3;
-  let tokenCount = 0;
-
-  while (toolCallRound <= MAX_TOOL_ROUNDS) {
-    let roundText = '';
-
-    onActivity('streaming', `\u5df2\u751f\u6210 0 \u4e2a token...`);
-
-    // eslint-disable-next-line no-await-in-loop
-    await ctx.completion(
-      {
-        messages: msgs as Parameters<typeof ctx.completion>[0]['messages'],
-        n_predict: inferenceParams.max_tokens,
-        temperature: inferenceParams.temperature,
-        top_p: inferenceParams.top_p,
-        top_k: inferenceParams.top_k,
-        penalty_repeat: inferenceParams.repeat_penalty,
-        stop: [...safeStop, '{"t":', '```json'],
-      },
-      (data: { token: string }) => {
-        const tok = data.token ?? '';
-        if (!tok) return;
-        // \u8fc7\u6ee4\u63a7\u5236\u5b57\u7b26\uff08thinking \u6807\u7b7e\u3001\u7279\u6b8a\u7b26\u53f7\uff09
-        const visible = tok.replace(/<\|[^|]+?\|>/g, '');
-        if (visible.length === 0) return;
-        roundText += visible;
-        if (toolCallRound === 0) {
-          fullResponse += visible;
-          tokenCount++;
-          if (tokenCount % 10 === 0 || tokenCount === 1) {
-            onActivity('streaming', `\u5df2\u751f\u6210 ${tokenCount} \u4e2a token...`);
-          }
-          pushToken(visible);
-        }
-      }
-    );
-
-    if (toolCallRound > 0) {
-      fullResponse += roundText;
-    }
-
-    const toolCalls = parseToolCalls(roundText);
-    if (toolCalls.length === 0) break;
-
-    toolCallRound++;
-    if (toolCallRound > MAX_TOOL_ROUNDS) break;
-
-    const names = toolCalls.map((t) => t.toolName).join(', ');
-    onActivity('tool_calling', `\u6b63\u5728\u8c03\u7528\u5de5\u5177\uff1a${names}...`);
-
-    const toolResults: string[] = [];
-    for (const tc of toolCalls) {
-      const category = getToolCategory(tc.toolName) ?? 'Files';
-      const toolCall: ToolCall = {
-        id: `tc_${Date.now()}_${tc.toolName}`,
-        toolName: tc.toolName,
-        toolCategory: category,
-        parameters: tc.parameters,
-        status: 'pending',
-      };
-
-      // eslint-disable-next-line no-await-in-loop
-      const resultStr = await onToolCall(toolCall);
-      toolResults.push(`[${tc.toolName}\u7ed3\u679c]: ${resultStr}`);
-    }
-
-    onActivity('tool_done', `\u5de5\u5177\u5df2\u8fd4\u56de\u7ed3\u679c`);
-
-    const toolResultContent = toolResults.join('\n');
-    msgs.push({ role: 'assistant', content: roundText });
-    msgs.push({ role: 'user', content: `\u5de5\u5177\u6267\u884c\u5b8c\u6210\uff1a\n${toolResultContent}\n\n\u8bf7\u6839\u636e\u4ee5\u4e0a\u7ed3\u679c\u7ee7\u7eed\u56de\u7b54\u3002` });
-  }
-
-  onActivity('streaming', `\u751f\u6210\u5b8c\u6210\uff08${tokenCount} tokens\uff09`);
-  return fullResponse;
-}
-
 // ─── Parse thinking tags ─────────────────────────────────────────────────────
 
-interface ParsedContent {
-  thinking: string;
-  response: string;
-}
+const BUILD20_CHAT_READY = true;
 
+const BUILD41_ACCESSIBILITY_BOUNDARY = true;
+
+interface ParsedContent { thinking: string; response: string; }
 function parseThinkingTags(text: string): ParsedContent {
-  // 先尝试匹配完整的 <think>...</think> 或 <thinking>...</thinking>
-  const thinkMatch = text.match(/<(?:think|thinking)>([\s\S]*?)<\/(?:think|thinking)>/);
-  if (thinkMatch) {
-    const thinking = thinkMatch[1].trim();
-    const response = text.replace(thinkMatch[0], '').trim();
-    return { thinking, response };
+  const normalized = text.replace(/<\|[^|]+?\|>/g, '').trim();
+  const complete = normalized.match(/<(?:think|thinking)>([\s\S]*?)<\/(?:think|thinking)>/i);
+  if (complete) return { thinking: complete[1].trim(), response: normalized.replace(complete[0], '').trim() };
+  const closing = normalized.match(/<\/(?:think|thinking)>/i);
+  if (closing && closing.index !== undefined) {
+    return { thinking: normalized.slice(0, closing.index).trim(), response: normalized.slice(closing.index + closing[0].length).trim() };
   }
-  // 流式输出时标签可能尚未闭合：检测未闭合的 <think> 或 <thinking> 开标签
-  const openMatch = text.match(/<(?:think|thinking)>([\s\S]*)$/);
-  if (openMatch) {
-    // 标签已开但未闭合，内容全部是思考过程
-    return { thinking: openMatch[1].trim(), response: '' };
-  }
-  // 检测是否刚刚闭合了思考标签但回复还没开始
-  const closedButEmpty = text.match(/^\s*<\/(?:think|thinking)>\s*$/);
-  if (closedButEmpty) {
-    return { thinking: '', response: '' };
-  }
-  return { thinking: '', response: text };
+  return { thinking: '', response: normalized };
 }
 
 // ─── Activity Message ────────────────────────────────────────────────────────
@@ -196,144 +71,85 @@ const ActivityMessage = memo(function ActivityMessage({
 
 // ─── Message Item ────────────────────────────────────────────────────────────
 
-const MessageItem = memo(function MessageItem({
-  item,
-  colors,
-}: {
+const MessageItem = memo(function MessageItem({ item, colors }: {
   item: ChatMessage;
   colors: ReturnType<typeof useColors>;
 }) {
   const isUser = item.role === 'user';
-  const { thinking, response } = isUser ? { thinking: '', response: item.content } : parseThinkingTags(item.content);
+  const legacy = isUser ? { thinking: '', response: item.content } : parseThinkingTags(item.content);
+  const thinking = isUser ? '' : (item.reasoning?.trim() || legacy.thinking);
+  const response = isUser ? item.content : (legacy.response || (thinking ? '模型没有生成最终回答。' : item.content));
   const [showThinking, setShowThinking] = useState(false);
 
   return (
-    <View
-      style={[styles.msgRow, isUser ? styles.msgRowUser : styles.msgRowAssistant]}
-      accessible
-      accessibilityLabel={`${isUser ? '\u60a8' : 'AI'}\uff1a${response || item.content}`}
-      accessibilityRole="text"
-    >
+    <View style={[styles.msgRow, isUser ? styles.msgRowUser : styles.msgRowAssistant]} accessible={false}>
       <View
-        style={[
-          styles.msgBubble,
-          {
-            backgroundColor: isUser ? colors.primary : colors.surface,
-            borderColor: isUser ? colors.primary : colors.border,
-          },
-        ]}
+        style={[styles.msgBubble, {
+          backgroundColor: isUser ? colors.primary : colors.surface,
+          borderColor: isUser ? colors.primary : colors.border,
+        }]}
+        accessible={false}
       >
-        {/* \u601d\u8003\u5185\u5bb9\uff08\u53ef\u6298\u53e0\uff09 */}
         {!isUser && thinking.length > 0 && (
-          <View style={styles.thinkingContainer}>
+          <View style={styles.thinkingContainer} accessible={false}>
             <TouchableOpacity
-n              onPress={() => setShowThinking(!showThinking)}
+              onPress={() => setShowThinking((value) => !value)}
               accessible
               accessibilityRole="button"
-              accessibilityLabel={`${showThinking ? '\u9690\u85cf' : '\u5c55\u5f00'}\u601d\u8003\u8fc7\u7a0b`}
+              accessibilityLabel={`${showThinking ? '隐藏' : '展开'}思考过程`}
+              accessibilityState={{ expanded: showThinking }}
+              importantForAccessibility="yes"
               style={styles.thinkingToggle}
             >
               <Text style={[styles.thinkingToggleText, { color: colors.muted }]}>
-                {showThinking ? '\u25bc \u601d\u8003\u8fc7\u7a0b' : '\u25b6 \u601d\u8003\u8fc7\u7a0b'}
+                {showThinking ? '▼ 思考过程' : '▶ 思考过程'}
               </Text>
             </TouchableOpacity>
             {showThinking && (
-              <View style={[styles.thinkingContent, { borderColor: colors.border }]} accessible accessibilityLabel="\u601d\u8003\u8fc7\u7a0b\u5185\u5bb9">
-                <Text style={[styles.thinkingText, { color: colors.muted }]}>
-                  {thinking}
-                </Text>
+              <View style={[styles.thinkingContent, { borderColor: colors.border }]} accessible={false}>
+                <AccessibilityChunkedText
+                  text={thinking}
+                  label="思考过程"
+                  style={[styles.thinkingText, { color: colors.muted }]}
+                />
               </View>
             )}
           </View>
         )}
-        {/* \u6b63\u6587\u5185\u5bb9 */}
-        <Text
-          style={[
-            styles.msgText,
-            { color: isUser ? '#fff' : colors.foreground },
-          ]}
-          selectable
-        >
-          {response || item.content}
-        </Text>
+        <AccessibilityChunkedText
+          text={response}
+          label={isUser ? '您' : '最终回答'}
+          style={[styles.msgText, { color: isUser ? '#fff' : colors.foreground }]}
+        />
       </View>
-      <Text style={[styles.msgTime, { color: colors.muted }]}>
+      <Text style={[styles.msgTime, { color: colors.muted }]} accessible={false}>
         {new Date(item.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
       </Text>
     </View>
   );
 });
 
-// ─── Streaming Message (\u6d41\u5f0f\u8f93\u51fa\u4e13\u7528\u7ec4\u4ef6\uff0c\u4e0d\u8d70 store) ───────────────
-
-const StreamingMessage = memo(function StreamingMessage({
-  content,
-  activityText,
-  colors,
-}: {
-  content: string;
+const StreamingMessage = memo(function StreamingMessage({ activityText, colors }: {
   activityText: string;
   colors: ReturnType<typeof useColors>;
 }) {
-  // \u89e3\u6790 thinking \u6807\u7b7e
-  const { thinking, response } = parseThinkingTags(content);
-  const [showThinking, setShowThinking] = useState(false);
-
+  const status = activityText || 'AI 正在处理...';
   return (
-    <View style={[styles.msgRow, styles.msgRowAssistant]} accessible accessibilityLabel={`AI\uff1a${response || content || activityText}`} accessibilityRole="text">
-      <View
-        style={[
-          styles.msgBubble,
-          {
-            backgroundColor: colors.surface,
-            borderColor: colors.border,
-          },
-        ]}
-      >
-        {/* \u601d\u8003\u5185\u5bb9 */}
-        {thinking.length > 0 && (
-          <View style={styles.thinkingContainer}>
-            <TouchableOpacity
-n              onPress={() => setShowThinking(!showThinking)}
-              accessible
-              accessibilityRole="button"
-              accessibilityLabel={`${showThinking ? '\u9690\u85cf' : '\u5c55\u5f00'}\u601d\u8003\u8fc7\u7a0b`}
-              style={styles.thinkingToggle}
-            >
-              <Text style={[styles.thinkingToggleText, { color: colors.muted }]}>
-                {showThinking ? '\u25bc \u601d\u8003\u8fc7\u7a0b' : '\u25b6 \u601d\u8003\u8fc7\u7a0b'}
-              </Text>
-            </TouchableOpacity>
-            {showThinking && (
-              <View style={[styles.thinkingContent, { borderColor: colors.border }]} accessible accessibilityLabel="\u601d\u8003\u8fc7\u7a0b\u5185\u5bb9">
-                <Text style={[styles.thinkingText, { color: colors.muted }]}>
-                  {thinking}
-                </Text>
-              </View>
-            )}
-          </View>
-        )}
-        {/* \u6b63\u6587 */}
-        {!response && !thinking && (
-          <View style={styles.typingIndicator}>
-            <ActivityIndicator size="small" color={colors.muted} />
-            <Text style={[styles.typingText, { color: colors.muted }]}>{activityText}</Text>
-          </View>
-        )}
-        {(response || (thinking && !response)) && (
+    <View style={[styles.msgRow, styles.msgRowAssistant]} accessible={false}>
+      <View style={[styles.msgBubble, { backgroundColor: colors.surface, borderColor: colors.border }]} accessible={false}>
+        <View style={styles.typingIndicator} accessible={false}>
+          <ActivityIndicator size="small" color={colors.muted} />
           <Text
-            style={[styles.msgText, { color: colors.foreground }]}
-            selectable
+            style={[styles.typingText, { color: colors.muted }]}
+            accessible
+            accessibilityRole="text"
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={status}
           >
-            {response || ''}
-            {'\u258c'}
+            {status}
           </Text>
-        )}
+        </View>
       </View>
-      {/* activity \u63d0\u793a\u884c */}
-      <Text style={[styles.streamActivity, { color: colors.muted }]} numberOfLines={1}>
-        {activityText}
-      </Text>
     </View>
   );
 });
@@ -348,7 +164,6 @@ export default function ChatScreen() {
   const flatListRef = useRef<FlatList>(null);
 
   // \u6d41\u5f0f\u8f93\u51fa\u7684\u7eaf\u672c\u5730\u72b6\u6001\uff08\u4e0d\u8d70 store\uff0c\u907f\u514d FlatList \u5168\u91cf\u91cd\u6e32\u67d3\uff09
-  const [streamContent, setStreamContent] = useState('');
   const [streamActivity, setStreamActivity] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
 
@@ -476,46 +291,6 @@ export default function ChatScreen() {
   }, [pendingToolCall, resolveToolCall]);
 
   // \u521b\u5efa token \u63a8\u9001\u5668\uff08\u7eaf\u672c\u5730 useState\uff0c\u4e0d\u8d70 store\uff09
-  const createPushToken = useCallback(() => {
-    let pending = '';
-    let timerHandle: number | null = null;
-    let baseContent = '';
-
-    const flush = () => {
-      timerHandle = null;
-      if (pending.length > 0) {
-        const next = baseContent + pending;
-        pending = '';
-        baseContent = next;
-        setStreamContent(next);
-      }
-    };
-
-    return {
-      push(token: string) {
-        pending += token;
-        if (timerHandle == null) {
-          timerHandle = setTimeout(flush, 80) as unknown as number;
-        }
-      },
-      flush() {
-        if (timerHandle != null) {
-          clearTimeout(timerHandle as unknown as ReturnType<typeof setTimeout>);
-          timerHandle = null;
-        }
-        flush();
-      },
-      cancel() {
-        if (timerHandle != null) {
-          clearTimeout(timerHandle as unknown as ReturnType<typeof setTimeout>);
-          timerHandle = null;
-        }
-        pending = '';
-      },
-    };
-  }, []);
-
-  // \u53d1\u9001\u6d88\u606f
   const handleSend = useCallback(async () => {
     const text = inputText.trim();
     if (!text || isGenerating) return;
@@ -544,9 +319,7 @@ export default function ChatScreen() {
 
     // \u5f00\u59cb\u6d41\u5f0f\u8f93\u51fa\uff08\u7eaf\u672c\u5730\u72b6\u6001\uff0c\u4e0d\u8d70 store\uff09
     setIsStreaming(true);
-    setStreamContent('');
     setStreamActivity('AI \u6b63\u5728\u601d\u8003...');
-    const pusher = createPushToken();
 
     try {
       const currentMessages = useAppStore.getState().messages;
@@ -557,13 +330,11 @@ export default function ChatScreen() {
       // \u8ba9 UI \u6709\u673a\u4f1a\u6e32\u67d3\u521d\u59cb\u72b6\u6001
       await new Promise((r) => setTimeout(r, 50));
 
-      const finalText = await runInference(
+      const finalResult = await runInferenceOrchestrator(
         text,
         currentMessages,
         currentTools,
         currentParams,
-        ws,
-        (token) => pusher.push(token),
         handleToolCall,
         (kind, txt) => {
           if (kind === 'streaming') {
@@ -575,26 +346,22 @@ export default function ChatScreen() {
       );
 
       // flush \u6b8b\u4f59 token
-      pusher.flush();
-
       // \u7ed3\u675f\u6d41\u5f0f\u8f93\u51fa
       setIsStreaming(false);
-      setStreamContent('');
       setStreamActivity('');
 
       // \u4e00\u6b21\u6027\u5199\u5165 store\uff08\u4f9b\u6301\u4e45\u5316\uff09
       const assistantMsg: ChatMessage = {
         id: `msg_${Date.now()}_a`,
         role: 'assistant',
-        content: finalText,
+        content: finalResult.content,
+        reasoning: finalResult.reasoning || undefined,
         timestamp: Date.now(),
       };
       addMessage(assistantMsg);
     } catch (err) {
-      pusher.cancel();
       setIsStreaming(false);
       const errMsg = err instanceof Error ? err.message : '\u63a8\u7406\u5931\u8d25';
-      setStreamContent('');
       setStreamActivity('');
 
       const assistantMsg: ChatMessage = {
@@ -617,7 +384,6 @@ export default function ChatScreen() {
     setGenerating,
     setError,
     handleToolCall,
-    createPushToken,
   ]);
 
   const handleClearChat = useCallback(() => {
@@ -636,15 +402,15 @@ export default function ChatScreen() {
 
   // \u7ec4\u5408\u5217\u8868\u6570\u636e\uff1astore \u6d88\u606f + \u6d41\u5f0f\u8f93\u51fa\u5360\u4f4d
   const listData = isStreaming
-    ? [...messages, { id: '__streaming__', isStreaming: true, content: streamContent, role: 'assistant', timestamp: Date.now(), _activity: streamActivity } as unknown as ChatMessage]
+    ? [...messages, { id: '__streaming__', isStreaming: true, content: '', role: 'assistant', timestamp: Date.now(), _activity: streamActivity } as unknown as ChatMessage]
     : messages;
 
   const renderStreamingItem = useCallback(({ item }: { item: ChatMessage }) => {
     if ((item as any).id === '__streaming__') {
-      return <StreamingMessage content={streamContent} activityText={streamActivity} colors={colors} />;
+      return <StreamingMessage activityText={streamActivity} colors={colors} />;
     }
     return <MessageItem item={item} colors={colors} />;
-  }, [colors, streamContent, streamActivity]);
+  }, [colors, streamActivity]);
 
   return (
     <ScreenContainer>

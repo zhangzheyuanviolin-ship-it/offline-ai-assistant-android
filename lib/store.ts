@@ -48,7 +48,7 @@ function persistMessages(messages: ChatMessage[]) {
 }
 
 function persistModels(models: AIModel[]) {
-  const serializable = models.map((model) => ({ ...model, isLoaded: false }));
+  const serializable = models.map((model) => ({ ...model, isLoaded: false, storageMode: model.storageMode ?? (model.filePath.startsWith('content://') ? 'external' : 'copied') }));
   AsyncStorage.setItem('models', JSON.stringify(serializable)).catch(() => {});
 }
 
@@ -110,6 +110,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         ]);
 
         const storedModels: AIModel[] = modelsJson ? JSON.parse(modelsJson) : [];
+        const BUILD41_RUNTIME_STATE_AUTHORITY = true;
         const nativeModelId = getActiveContext() ? getActiveModelId() : null;
         const inferenceParams = paramsJson
           ? { ...DEFAULT_INFERENCE_PARAMS, ...JSON.parse(paramsJson) }
@@ -125,8 +126,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
         const messages: ChatMessage[] = messagesJson ? JSON.parse(messagesJson) : [];
 
         set({
-          models: storedModels.map((model) => ({ ...model, isLoaded: model.id === nativeModelId })),
-          activeModelId: nativeModelId ?? activeId ?? null,
+          models: storedModels.map((model) => ({
+            ...model,
+            storageMode: model.storageMode ?? (model.filePath.startsWith('content://') ? 'external' : 'copied'),
+            sourceUri: model.sourceUri ?? (model.filePath.startsWith('content://') ? model.filePath : undefined),
+            isLoaded: model.id === nativeModelId,
+          })),
+          activeModelId: nativeModelId,
           inferenceParams,
           toolsConfig,
           workspaceDir: wsJson || '',
@@ -276,4 +282,4 @@ export const useAppStore = create<AppStore>((set, get) => ({
 }));
 
 export const selectActiveModel = (state: AppStore) =>
-  state.models.find((model) => model.id === state.activeModelId) ?? null;
+  state.models.find((model) => model.id === state.activeModelId && model.isLoaded) ?? null;

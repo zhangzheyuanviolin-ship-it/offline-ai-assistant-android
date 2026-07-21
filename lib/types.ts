@@ -1,4 +1,5 @@
 /**
+ * BUILD41_MODEL_STORAGE_AND_REASONING
  * 核心类型定义 - Offline AI Assistant
  * llama.rn 0.12.6 / llama.cpp b9982
  */
@@ -14,13 +15,18 @@ export interface AIModel {
   format: 'gguf' | 'other';
   addedAt: number;
   isLoaded: boolean;
+  storageMode: 'copied' | 'external';
+  sourceUri?: string;
 }
 
 export interface InferenceParams {
   n_ctx: number;
   n_batch: number;
+  n_ubatch: number;
   n_threads: number;
   n_gpu_layers: number;
+  use_mmap: boolean;
+  use_mlock: boolean;
   temperature: number;
   top_p: number;
   top_k: number;
@@ -32,8 +38,11 @@ export interface InferenceParams {
 export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
   n_ctx: 2048,
   n_batch: 256,
+  n_ubatch: 64,
   n_threads: 4,
   n_gpu_layers: 0,
+  use_mmap: true,
+  use_mlock: false,
   temperature: 0.7,
   top_p: 0.9,
   top_k: 40,
@@ -69,6 +78,7 @@ export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  reasoning?: string;
   timestamp: number;
   isStreaming?: boolean;
   toolCalls?: ToolCall[];
