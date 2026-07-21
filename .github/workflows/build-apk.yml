@@ -41,18 +41,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply build20 source patches
+      - name: Apply and validate build21 source patches
+        run: pnpm build20:patch
+
+      - name: Verify nativeTools runtime scope
         run: |
-          python3 - << 'PYEOF'
-          path = 'scripts/apply-build20-patches.mjs'
-          content = open(path, 'r', encoding='utf-8').read()
-          content = content.replace(
-              "if (!content.includes(search)) throw new Error(`[build20] target not found: ${label}`);",
-              "if (!content.includes(search)) { console.warn(`[build20] optional target not found: ${label}`); return content; }"
-          )
-          open(path, 'w', encoding='utf-8').write(content)
-          PYEOF
-          pnpm build20:patch
+          grep -F "const nativeTools = buildNativeTools(toolsConfig);" "app/(tabs)/index.tsx"
+          grep -F "tools: nativeTools," "app/(tabs)/index.tsx"
+          grep -F "export function buildNativeTools" "lib/services/tools-service.ts"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -141,12 +137,11 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant build20 test release
-            - Native llama.rn tool calling with compact schemas and balanced-JSON fallback.
-            - Qwen closing-only thinking tags are separated from final answers.
-            - Thinking toggle and final answer are separate accessibility targets.
-            - Tool protocol JSON is removed from persisted assistant prose.
-            - GGUF picker cache copy is disabled to avoid double-copying large models.
+            ## Offline AI Assistant build21 runtime-fix release
+            - Fixes the Hermes runtime error: Property 'nativeTools' doesn't exist.
+            - Verifies nativeTools is declared inside runInference before APK compilation.
+            - Keeps compact native llama.rn tool schemas and balanced-JSON fallback parsing.
+            - Keeps Qwen thinking separation and single-copy GGUF import.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
