@@ -101,7 +101,24 @@ jobs:
           fi
 
       - name: TypeScript validation
-        run: pnpm check
+        id: typecheck
+        run: |
+          set +e
+          pnpm check > typecheck.log 2>&1
+          status=$?
+          cat typecheck.log
+          if [ $status -ne 0 ]; then
+            cp typecheck.log typecheck-error.txt
+            exit $status
+          fi
+
+      - name: Upload TypeScript error
+        if: failure() && steps.typecheck.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build41-typecheck-error
+          path: typecheck-error.txt
+          retention-days: 7
 
       - name: Cache Gradle
         uses: actions/cache@v4
