@@ -41,59 +41,50 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply build21 base patches
+      - name: Apply native tool parser base
         run: pnpm build20:patch
 
-      - name: Apply build22 runtime patches
-        id: build22_patch
+      - name: Apply build41 sustainable architecture
+        id: build41_patch
         run: |
-          python3 - << 'PYEOF'
-          path = 'scripts/apply-build22-patches.mjs'
-          content = open(path, 'r', encoding='utf-8').read()
-          content = content.replace(
-              'return content.slice(0, startIndex) + replacement + content.slice(endIndex);',
-              'return content.slice(0, startIndex) + replacement + content.slice(endIndex + end.length);'
-          )
-          content = content.replace(
-              'const loopEnd = "  onActivity(\'streaming\', `生成完成（${tokenCount} tokens）`);";',
-              "const loopEnd = '  return fullResponse;' ;"
-          )
-          open(path, 'w', encoding='utf-8').write(content)
-          PYEOF
           set +e
-          node scripts/apply-build22-patches.mjs > build22-patch.log 2>&1
+          node scripts/apply-build41-patches.mjs > build41-patch.log 2>&1
           status=$?
-          cat build22-patch.log
+          cat build41-patch.log
           if [ $status -ne 0 ]; then
-            tail -120 build22-patch.log > build22-patch-error.txt
+            tail -160 build41-patch.log > build41-patch-error.txt
             exit $status
           fi
 
-      - name: Upload build22 patch error
-        if: failure() && steps.build22_patch.outcome == 'failure'
+      - name: Upload build41 patch error
+        if: failure() && steps.build41_patch.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: build22-patch-error
-          path: build22-patch-error.txt
+          name: build41-patch-error
+          path: build41-patch-error.txt
           retention-days: 7
 
-      - name: Validate build22 critical paths
+      - name: Validate critical safety invariants
         run: |
-          grep -F "const configuredNativeTools = buildNativeTools(toolsConfig);" "app/(tabs)/index.tsx"
-          grep -F "const BUILD22_TOOL_LOOP_READY = true;" "app/(tabs)/index.tsx"
-          grep -F "formatToolResultForModel" "app/(tabs)/index.tsx"
-          grep -F "BUILD22_SEARCH_RESULTS_READY" "lib/services/tools-service.ts"
-          grep -F "BUILD22_LARGE_MODEL_SAFE_PROFILE" "lib/services/model-service.ts"
-          grep -F "n_ubatch" "app/(tabs)/settings.tsx"
-          grep -F "large_model_safe_mode" "lib/types.ts"
-          if grep -F "callback({ token: summary }" "lib/services/model-service.ts"; then
-            echo "Performance diagnostics still contaminate model output" >&2
+          grep -F "runInferenceOrchestrator" "app/(tabs)/index.tsx"
+          grep -F "role: 'tool'" "lib/services/inference-orchestrator.ts"
+          grep -F "tool_calls: nativeCalls" "lib/services/inference-orchestrator.ts"
+          grep -F "AccessibilityChunkedText" "app/(tabs)/index.tsx"
+          grep -F "openExternalModelUri" "lib/services/model-service.ts"
+          grep -F "activeModelId: nativeModelId," "lib/store.ts"
+          grep -F "内存映射 (mmap)" "app/(tabs)/settings.tsx"
+          grep -F "直接引用（推荐大模型）" "app/(tabs)/models.tsx"
+          if grep -E "本轮已生成|MAX_TOOL_ROUNDS|createPushToken" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
+            echo "Catastrophic cumulative streaming or fixed tool cap remains" >&2
             exit 1
           fi
-          if grep -F 'accessible accessibilityLabel={`AI：${response || content || activityText}`}' "app/(tabs)/index.tsx"; then
-            echo "Streaming thinking control is still grouped into one accessibility node" >&2
+          if grep -F "data.content ?? data.token" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
+            echo "Cumulative llama.rn content is still being appended as a token" >&2
             exit 1
           fi
+
+      - name: TypeScript validation
+        run: pnpm check
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -105,10 +96,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Expo prebuild (Android)
+      - name: Expo prebuild Android
         run: npx expo prebuild --platform android --clean --no-install
         env:
           EXPO_NO_TELEMETRY: 1
+
+      - name: Inject external GGUF SAF bridge
+        run: |
+          node scripts/inject-external-model-native.mjs
+          grep -R -F "class ExternalModelFileModule" android/app/src/main/java
+          grep -R -F "add(ExternalModelFilePackage())" android/app/src/main/java
+          grep -R -F '"/proc/self/fd/$fd"' android/app/src/main/java
 
       - name: Decode and place keystore
         run: |
@@ -167,6 +165,7 @@ jobs:
           cp "$APK_SRC" "dist/$APK_NAME"
           echo "APK_NAME=$APK_NAME" >> $GITHUB_ENV
           echo "APK_PATH=dist/$APK_NAME" >> $GITHUB_ENV
+          sha256sum "dist/$APK_NAME" | tee dist/SHA256SUMS.txt
           ls -lh "dist/$APK_NAME"
 
       - name: Upload APK artifact
@@ -182,13 +181,16 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant build22 test release
-            - Keeps performance diagnostics out of model text and tool results.
-            - Parses DuckDuckGo result titles, decoded links, and snippets; rejects template placeholders.
-            - Prevents repeated identical tool calls and keeps only the final answer.
-            - Fixes independent expand/collapse controls for thinking content.
-            - Adds mmap, mlock, n_ubatch, and large-model safe mode settings.
-            - Applies conservative CPU/KV/batch settings to model files larger than 12 GB.
+            ## Build41 safety and architecture release
+            - Removes the build39 cumulative-content loop that caused quadratic JS memory growth and screen-reader lockups.
+            - Uses the official llama.rn assistant/tool message pattern for unrestricted multi-step tool chains.
+            - Keeps every user-enabled tool available on every tool round; only repeated identical-call loops are stopped.
+            - Separates reasoning from final answers and exposes long text in bounded screen-reader chunks.
+            - Adds direct external GGUF references through Android SAF file descriptors without copying model weights.
+            - Keeps copy import as a compatibility option.
+            - Makes native runtime context the sole authority for loaded/unloaded model state.
+            - Adds user-controlled mmap, mlock and n_ubatch settings plus an optional 30B MoE preset.
+            - Isolates Tavily, Exa, DuckDuckGo and Baidu adapters so a parser fix cannot silently change another engine.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
@@ -197,6 +199,6 @@ jobs:
 
       - name: Build Summary
         run: |
-          echo "## ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Successful" >> $GITHUB_STEP_SUMMARY
           echo "**APK**: \`${{ env.APK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Download from [Releases](https://github.com/zhangzheyuanviolin-ship-it/offline-ai-assistant-android/releases)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
