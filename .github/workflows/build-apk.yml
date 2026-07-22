@@ -45,12 +45,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply build21 inference-process patch
+      - name: Apply build21 preset patch
         run: |
           node scripts/apply-build21-inference-process-patches.mjs
           grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
-          grep -F "InferenceProcessService" scripts/inject-external-model-native.mjs
-          grep -F 'android:process=":inference"' scripts/inject-external-model-native.mjs
 
       - name: Validate architecture invariants
         run: |
@@ -110,10 +108,12 @@ jobs:
       - name: Inject Android path resolver, memory diagnostics and inference process
         run: |
           node scripts/inject-external-model-native.mjs
+          node scripts/inject-inference-process-native.mjs
           grep -R -F "class ExternalModelFileModule" android/app/src/main/java
           grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
           grep -R -F "class InferenceProcessService" android/app/src/main/java
           grep -R -F "class InferenceProcessModule" android/app/src/main/java
+          grep -R -F "InferenceProcessModule(reactContext)" android/app/src/main/java
           grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
           grep -R -F "Os.readlink" android/app/src/main/java
           grep -R -F "getHistoricalProcessExitReasons" android/app/src/main/java
@@ -208,7 +208,7 @@ jobs:
             ## Build 21: inference-process experiment
             - Fixes the CPU MoE preset by using Q8 K cache with F16 V cache while flash attention is disabled.
             - Adds a non-exported Android service hosted in the dedicated `:inference` process.
-            - Adds React Native IPC lifecycle plumbing for starting and stopping the inference process.
+            - Adds Messenger IPC lifecycle plumbing for starting and stopping the inference process.
             - Preserves the existing streaming, tool-calling, external model path and memory diagnostics behavior.
           files: ${{ env.APK_PATH }}
           draft: false
