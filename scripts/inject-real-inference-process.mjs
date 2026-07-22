@@ -48,17 +48,23 @@ class InferenceProcessService : HeadlessJsTaskService() {
     fun dispatchToClient(requestId: String, type: String, payloadJson: String) {
       instance?.dispatchEvent(requestId, type, payloadJson)
     }
+
+    fun markWorkerReady() {
+      instance?.onWorkerReady()
+    }
   }
 
   private val handler = Handler(Looper.getMainLooper())
   private var client: Messenger? = null
+  private var workerReady = false
+  private val queuedCommands = ArrayDeque<String>()
   private val incoming = Messenger(object : Handler(Looper.getMainLooper()) {
     override fun handleMessage(message: Message) {
       when (message.what) {
         MSG_REGISTER_CLIENT -> client = message.replyTo
         MSG_COMMAND -> {
           val json = message.data.getString("json").orEmpty()
-          emitCommandWhenReady(json, 0)
+          if (workerReady) emitCommand(json) else queuedCommands.addLast(json)
         }
         else -> super.handleMessage(message)
       }
@@ -71,6 +77,8 @@ class InferenceProcessService : HeadlessJsTaskService() {
   }
 
   override fun onDestroy() {
+    workerReady = false
+    queuedCommands.clear()
     if (instance === this) instance = null
     super.onDestroy()
   }
@@ -85,12 +93,19 @@ class InferenceProcessService : HeadlessJsTaskService() {
   override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig =
     HeadlessJsTaskConfig("OfflineInferenceWorker", Arguments.createMap(), 0, true)
 
-  private fun emitCommandWhenReady(json: String, attempt: Int) {
+  private fun onWorkerReady() {
+    handler.post {
+      workerReady = true
+      while (queuedCommands.isNotEmpty()) emitCommand(queuedCommands.removeFirst())
+    }
+  }
+
+  private fun emitCommand(json: String) {
     val app = application as ReactApplication
     val reactContext = app.reactNativeHost.reactInstanceManager.currentReactContext
     if (reactContext == null) {
-      if (attempt < 300) handler.postDelayed({ emitCommandWhenReady(json, attempt + 1) }, 100)
-      else dispatchEvent("", "error", """{"message":"推理进程 JavaScript 运行时启动超时"}""")
+      queuedCommands.addFirst(json)
+      workerReady = false
       return
     }
     reactContext
@@ -225,6 +240,11 @@ class InferenceWorkerBridgeModule(
   override fun getName(): String = "InferenceWorkerBridge"
 
   @ReactMethod
+  fun ready() {
+    InferenceProcessService.markWorkerReady()
+  }
+
+  @ReactMethod
   fun emit(requestId: String, type: String, payloadJson: String) {
     InferenceProcessService.dispatchToClient(requestId, type, payloadJson)
   }
@@ -257,4 +277,4 @@ manifest = manifest.replace(
 );
 fs.writeFileSync(manifestPath, manifest, 'utf8');
 
-console.log('[inference-process] real headless llama.rn process injected');
+console.log('[inference-process] isolated worker readiness handshake injected');
