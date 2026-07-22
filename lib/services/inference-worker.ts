@@ -1,15 +1,15 @@
-import { DeviceEventEmitter, NativeModules } from 'react-native';
+import { NativeModules } from 'react-native';
 import { initLlama, releaseAllLlama, type LlamaContext } from 'llama.rn';
 import type { InferenceParams } from '../types';
 
 const WorkerBridge = NativeModules.InferenceWorkerBridge as {
   emit(requestId: string, type: string, payloadJson: string): void;
   ready(): void;
+  waitForCommand(): Promise<string>;
 };
 
 let activeContext: LlamaContext | null = null;
 let activeModelId: string | null = null;
-let commandChain: Promise<void> = Promise.resolve();
 
 function emit(requestId: string, type: string, payload: unknown): void {
   WorkerBridge.emit(requestId, type, JSON.stringify(payload ?? null));
@@ -33,6 +33,7 @@ async function handleCommand(raw: string): Promise<void> {
   try {
     if (type === 'load') {
       if (!command.modelPath || !command.params) throw new Error('模型路径或推理参数缺失');
+      emit(requestId, 'progress', { progress: 1, stage: 'worker_received_load' });
       if (activeContext) {
         await activeContext.release();
         activeContext = null;
@@ -56,7 +57,7 @@ async function handleCommand(raw: string): Promise<void> {
           flash_attn_type: params.n_gpu_layers > 0 ? 'auto' : 'off',
           swa_full: false,
         } as Parameters<typeof initLlama>[0],
-        (progress) => emit(requestId, 'progress', { progress })
+        (progress) => emit(requestId, 'progress', { progress, stage: 'llama_loading' })
       );
       activeModelId = command.modelId ?? null;
       emit(requestId, 'result', { loaded: true, modelId: activeModelId });
@@ -104,9 +105,9 @@ async function handleCommand(raw: string): Promise<void> {
 }
 
 export async function inferenceWorkerTask(): Promise<never> {
-  DeviceEventEmitter.addListener('OfflineInferenceCommand', (raw: string) => {
-    commandChain = commandChain.then(() => handleCommand(raw));
-  });
   WorkerBridge.ready();
-  return new Promise<never>(() => {});
+  while (true) {
+    const raw = await WorkerBridge.waitForCommand();
+    await handleCommand(raw);
+  }
 }
