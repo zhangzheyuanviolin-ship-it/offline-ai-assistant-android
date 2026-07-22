@@ -1,0 +1,2 @@
+GitHub connector read/write permission test.
+Created temporarily on 2026-07-22 and intended for immediate deletion.
