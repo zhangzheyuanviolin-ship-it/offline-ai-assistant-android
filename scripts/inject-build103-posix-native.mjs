@@ -90,9 +90,10 @@ worker = worker.replace(
 );
 fs.writeFileSync(workerPath, worker, 'utf8');
 
-// Expo 54 can point the app's externalNativeBuild directly at React Native's
-// default application CMake file in node_modules. Find the actual entry used by
-// Gradle instead of assuming android/app owns it.
+// Expo 54 points externalNativeBuild at React Native's default application
+// CMake entry in node_modules. Locate that actual entry, but keep our source
+// outside its *.cpp glob so it is compiled only into hyperosmemory, never into
+// the main appmodules target.
 const cmakePath = walk('.', (full, name) => {
   if (name !== 'CMakeLists.txt') return false;
   try {
@@ -102,10 +103,13 @@ const cmakePath = walk('.', (full, name) => {
   }
 });
 if (!cmakePath) throw new Error('[build103-posix] React Native application CMakeLists.txt not found');
-const cppPath = path.join(path.dirname(cmakePath), 'hyperos_memory_jni.cpp');
+
+const sourceDir = 'android/app/src/main/jni';
+fs.mkdirSync(sourceDir, { recursive: true });
+const cppPath = path.join(sourceDir, 'hyperos_memory_jni.cpp');
+const absoluteCppPath = path.resolve(cppPath).replaceAll('\\', '/');
 const classPath = `${packageName.replaceAll('.', '/')}/InferenceWorkerBridgeModule`;
-const cpp = `#define _GNU_SOURCE
-#include <jni.h>
+const cpp = `#include <jni.h>
 #include <cerrno>
 #include <fcntl.h>
 
@@ -143,15 +147,12 @@ fs.writeFileSync(cppPath, cpp, 'utf8');
 
 let cmake = fs.readFileSync(cmakePath, 'utf8');
 if (!cmake.includes('add_library(hyperosmemory')) {
-  cmake += `\n# Build103: tiny JNI bridge for POSIX_FADV_DONTNEED.\nadd_library(hyperosmemory SHARED hyperos_memory_jni.cpp)\n`;
+  cmake += `\n# Build103: tiny isolated JNI bridge for POSIX_FADV_DONTNEED.\nadd_library(hyperosmemory SHARED "${absoluteCppPath}")\n`;
 }
 fs.writeFileSync(cmakePath, cmake, 'utf8');
 
-// Keep an app-local mirror only for deterministic workflow inspection. The
-// actual compiled source remains next to the CMake entry resolved above.
-const mirrorDir = 'android/app/src/main/jni';
-fs.mkdirSync(mirrorDir, { recursive: true });
-fs.writeFileSync(path.join(mirrorDir, 'hyperos_memory_jni.cpp'), cpp, 'utf8');
+// Deterministic marker for workflow inspection without depending on the
+// runner's absolute checkout path.
 fs.writeFileSync(
   'android/app/build103-cmake-target.txt',
   'add_library(hyperosmemory SHARED hyperos_memory_jni.cpp)\n',
@@ -167,11 +168,15 @@ for (const required of [
 ]) {
   if (!finalWorker.includes(required)) throw new Error(`[build103-posix] worker invariant missing: ${required}`);
 }
-if (!finalCmake.includes('add_library(hyperosmemory SHARED hyperos_memory_jni.cpp)')) {
+if (!finalCmake.includes('add_library(hyperosmemory SHARED')) {
   throw new Error('[build103-posix] CMake target invariant missing');
 }
-if (!fs.readFileSync(cppPath, 'utf8').includes('POSIX_FADV_DONTNEED')) {
+const finalCpp = fs.readFileSync(cppPath, 'utf8');
+if (!finalCpp.includes('POSIX_FADV_DONTNEED')) {
   throw new Error('[build103-posix] native fadvise invariant missing');
 }
+if (finalCpp.includes('#define _GNU_SOURCE')) {
+  throw new Error('[build103-posix] duplicate _GNU_SOURCE definition remains');
+}
 
-console.log(`[build103-posix] JNI page-cache bridge injected via ${cmakePath}; source ${cppPath}`);
+console.log(`[build103-posix] isolated JNI page-cache bridge injected via ${cmakePath}; source ${cppPath}`);
