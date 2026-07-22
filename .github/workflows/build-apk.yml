@@ -45,10 +45,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply build21 preset patch
+      - name: Apply real inference-process routing
         run: |
-          node scripts/apply-build21-inference-process-patches.mjs
+          node scripts/apply-build22-real-inference-process.mjs
+          grep -F '"main": "index.js"' package.json
+          grep -F 'createRemoteLlamaContext' lib/services/model-service.ts
           grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
+          grep -F "registerHeadlessTask('OfflineInferenceWorker'" index.js
 
       - name: Validate architecture invariants
         run: |
@@ -57,7 +60,6 @@ jobs:
           grep -F "role: 'tool'" "lib/services/inference-orchestrator.ts"
           grep -F "tool_calls: nativeCalls" "lib/services/inference-orchestrator.ts"
           grep -F "resolveExternalModelUri" "lib/services/model-service.ts"
-          grep -F "cache_type_k" "lib/services/model-service.ts"
           grep -F "memoryGuardTriggered" "lib/services/model-service.ts"
           grep -F "activeModelId: nativeModelId" "lib/store.ts"
           grep -F "保存并立即重新加载" "app/(tabs)/settings.tsx"
@@ -86,7 +88,7 @@ jobs:
         if: failure() && steps.typecheck.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: streaming-memory-typecheck-error
+          name: isolated-inference-typecheck-error
           path: typecheck-error.txt
           retention-days: 7
 
@@ -105,18 +107,18 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - name: Inject Android path resolver, memory diagnostics and inference process
+      - name: Inject Android native bridges and isolated inference service
         run: |
           node scripts/inject-external-model-native.mjs
-          node scripts/inject-inference-process-native.mjs
+          node scripts/inject-real-inference-process.mjs
           grep -R -F "class ExternalModelFileModule" android/app/src/main/java
           grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
           grep -R -F "class InferenceProcessService" android/app/src/main/java
           grep -R -F "class InferenceProcessModule" android/app/src/main/java
-          grep -R -F "InferenceProcessModule(reactContext)" android/app/src/main/java
+          grep -R -F "class InferenceWorkerBridgeModule" android/app/src/main/java
+          grep -R -F "InferenceWorkerBridgeModule(reactContext)" android/app/src/main/java
+          grep -R -F "HeadlessJsTaskService" android/app/src/main/java
           grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
-          grep -R -F "Os.readlink" android/app/src/main/java
-          grep -R -F "getHistoricalProcessExitReasons" android/app/src/main/java
           grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
       - name: Decode and place keystore
@@ -174,7 +176,7 @@ jobs:
         if: failure() && steps.gradle_build.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: streaming-memory-native-build-error
+          name: isolated-inference-native-build-error
           path: gradle-build-error.txt
           retention-days: 7
 
@@ -205,11 +207,11 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Build 21: inference-process experiment
-            - Fixes the CPU MoE preset by using Q8 K cache with F16 V cache while flash attention is disabled.
-            - Adds a non-exported Android service hosted in the dedicated `:inference` process.
-            - Adds Messenger IPC lifecycle plumbing for starting and stopping the inference process.
-            - Preserves the existing streaming, tool-calling, external model path and memory diagnostics behavior.
+            ## Build 22: real isolated llama.rn inference
+            - Loads GGUF models inside the dedicated Android `:inference` process.
+            - Runs completion, streaming callbacks, stop and release through Messenger IPC.
+            - Keeps the React Native UI in the main process so model PSS is separated from UI PSS.
+            - Fixes the CPU MoE preset with Q8 K cache and F16 V cache while flash attention is disabled.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
