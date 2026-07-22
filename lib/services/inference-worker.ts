@@ -4,6 +4,7 @@ import type { InferenceParams } from '../types';
 
 const WorkerBridge = NativeModules.InferenceWorkerBridge as {
   emit(requestId: string, type: string, payloadJson: string): void;
+  ready(): void;
 };
 
 let activeContext: LlamaContext | null = null;
@@ -106,5 +107,6 @@ export async function inferenceWorkerTask(): Promise<never> {
   DeviceEventEmitter.addListener('OfflineInferenceCommand', (raw: string) => {
     commandChain = commandChain.then(() => handleCommand(raw));
   });
+  WorkerBridge.ready();
   return new Promise<never>(() => {});
 }
