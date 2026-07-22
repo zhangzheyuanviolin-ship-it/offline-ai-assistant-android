@@ -45,13 +45,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply real inference-process routing
+      - name: Apply real inference-process routing and Build98 memory experiment
         run: |
           node scripts/apply-build22-real-inference-process.mjs
+          node scripts/apply-build98-hyperos-memory.mjs
           grep -F '"main": "index.js"' package.json
           grep -F 'createRemoteLlamaContext' lib/services/model-service.ts
           grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
           grep -F "registerHeadlessTask('OfflineInferenceWorker'" index.js
+          grep -F 'low_residency_enabled' lib/types.ts
+          grep -F 'getLatestInferenceDiagnostic' lib/services/runtime-memory.ts
+          grep -F 'dropFileCache' lib/services/inference-worker.ts
+          grep -F 'HyperOS 低驻留实验预设' "app/(tabs)/settings.tsx"
 
       - name: Validate architecture invariants
         run: |
@@ -107,10 +112,11 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - name: Inject Android native bridges and isolated inference service
+      - name: Inject Android native bridges, isolated inference service and Build98 diagnostics
         run: |
           node scripts/inject-external-model-native.mjs
           node scripts/inject-real-inference-process.mjs
+          node scripts/inject-build98-memory-native.mjs
           grep -R -F "class ExternalModelFileModule" android/app/src/main/java
           grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
           grep -R -F "class InferenceProcessService" android/app/src/main/java
@@ -119,6 +125,9 @@ jobs:
           grep -R -F "InferenceWorkerBridgeModule(reactContext)" android/app/src/main/java
           grep -R -F "HeadlessJsTaskService" android/app/src/main/java
           grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
+          grep -R -F "POSIX_FADV_DONTNEED" android/app/src/main/java
+          grep -R -F "Pss_File" android/app/src/main/java
+          grep -R -F "getLatestInferenceDiagnostic" android/app/src/main/java
           grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
       - name: Decode and place keystore
@@ -207,11 +216,12 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Build 22: real isolated llama.rn inference
-            - Loads GGUF models inside the dedicated Android `:inference` process.
-            - Runs completion, streaming callbacks, stop and release through Messenger IPC.
-            - Keeps the React Native UI in the main process so model PSS is separated from UI PSS.
-            - Fixes the CPU MoE preset with Q8 K cache and F16 V cache while flash attention is disabled.
+            ## Build 98: HyperOS PSS diagnostics and low-residency experiment
+            - Keeps llama.rn inference in the dedicated Android `:inference` process.
+            - Persists inference-process Pss_File, Pss_Anon, RSS, SwapPss and system-memory samples throughout loading and generation.
+            - Preserves the final memory sample when HyperOS force-stops the package, so it can be read after reopening the app.
+            - Adds an optional low-residency mode that periodically issues POSIX_FADV_DONTNEED for the active GGUF file.
+            - Leaves the experiment disabled by default and provides an accessible HyperOS preset in Settings.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
