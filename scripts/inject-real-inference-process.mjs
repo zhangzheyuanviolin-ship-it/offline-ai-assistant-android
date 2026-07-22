@@ -75,7 +75,7 @@ class InferenceProcessService : HeadlessJsTaskService() {
     super.onDestroy()
   }
 
-  override fun onBind(intent: Intent?): IBinder = incoming.binder
+  override fun onBind(intent: Intent): IBinder = incoming.binder
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     super.onStartCommand(intent, flags, startId)
@@ -90,7 +90,7 @@ class InferenceProcessService : HeadlessJsTaskService() {
     val reactContext = app.reactNativeHost.reactInstanceManager.currentReactContext
     if (reactContext == null) {
       if (attempt < 300) handler.postDelayed({ emitCommandWhenReady(json, attempt + 1) }, 100)
-      else dispatchEvent("", "error", "{\"message\":\"推理进程 JavaScript 运行时启动超时\"}")
+      else dispatchEvent("", "error", """{"message":"推理进程 JavaScript 运行时启动超时"}""")
       return
     }
     reactContext
