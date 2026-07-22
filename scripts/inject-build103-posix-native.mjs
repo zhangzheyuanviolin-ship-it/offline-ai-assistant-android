@@ -4,7 +4,12 @@ import path from 'node:path';
 function walk(dir, predicate) {
   if (!fs.existsSync(dir)) return null;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'build' || entry.name === '.cxx') continue;
+    if (
+      entry.name === 'build'
+      || entry.name === '.cxx'
+      || entry.name === '.git'
+      || entry.name === '.expo'
+    ) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       const found = walk(full, predicate);
@@ -85,7 +90,10 @@ worker = worker.replace(
 );
 fs.writeFileSync(workerPath, worker, 'utf8');
 
-const cmakePath = walk('android/app', (full, name) => {
+// React Native 0.81 / Expo 54 may reference the default application CMake file
+// directly from node_modules instead of placing an app-owned CMakeLists under
+// android/app. Search the actual workspace for the unique application entry.
+const cmakePath = walk('.', (full, name) => {
   if (name !== 'CMakeLists.txt') return false;
   try {
     return fs.readFileSync(full, 'utf8').includes('ReactNative-application.cmake');
@@ -155,4 +163,4 @@ if (!fs.readFileSync(cppPath, 'utf8').includes('POSIX_FADV_DONTNEED')) {
   throw new Error('[build103-posix] native fadvise invariant missing');
 }
 
-console.log(`[build103-posix] JNI page-cache bridge injected at ${cppPath}`);
+console.log(`[build103-posix] JNI page-cache bridge injected via ${cmakePath}; source ${cppPath}`);
