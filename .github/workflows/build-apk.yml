@@ -2,7 +2,7 @@ name: Build Signed Android APK
 
 on:
   push:
-    branches: [main, agent/build19-diagnostics-stability, agent/build20-tools-thinking-large-models]
+    branches: [main, agent/build19-diagnostics-stability, agent/build20-tools-thinking-large-models, agent/build98-hyperos-memory-diagnostics]
   workflow_dispatch:
     inputs:
       version_name:
@@ -117,6 +117,16 @@ jobs:
           node scripts/inject-external-model-native.mjs
           node scripts/inject-real-inference-process.mjs
           node scripts/inject-build98-memory-native.mjs
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          for path in Path('android/app/src/main/java').rglob('InferenceWorkerBridgeModule.kt'):
+              text = path.read_text(encoding='utf-8')
+              text = text.replace(
+                  'lines.filter { it.isNotBlank() }.takeLast(200).joinToString("\\n")',
+                  'lines.filter { it.isNotBlank() }.toList().takeLast(200).joinToString("\\n")'
+              )
+              path.write_text(text, encoding='utf-8')
+          PYEOF
           grep -R -F "class ExternalModelFileModule" android/app/src/main/java
           grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
           grep -R -F "class InferenceProcessService" android/app/src/main/java
@@ -128,6 +138,7 @@ jobs:
           grep -R -F "POSIX_FADV_DONTNEED" android/app/src/main/java
           grep -R -F "Pss_File" android/app/src/main/java
           grep -R -F "getLatestInferenceDiagnostic" android/app/src/main/java
+          grep -R -F "toList().takeLast(200)" android/app/src/main/java
           grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
       - name: Decode and place keystore
