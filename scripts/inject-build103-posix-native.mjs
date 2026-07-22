@@ -90,9 +90,9 @@ worker = worker.replace(
 );
 fs.writeFileSync(workerPath, worker, 'utf8');
 
-// React Native 0.81 / Expo 54 may reference the default application CMake file
-// directly from node_modules instead of placing an app-owned CMakeLists under
-// android/app. Search the actual workspace for the unique application entry.
+// Expo 54 can point the app's externalNativeBuild directly at React Native's
+// default application CMake file in node_modules. Find the actual entry used by
+// Gradle instead of assuming android/app owns it.
 const cmakePath = walk('.', (full, name) => {
   if (name !== 'CMakeLists.txt') return false;
   try {
@@ -146,6 +146,17 @@ if (!cmake.includes('add_library(hyperosmemory')) {
   cmake += `\n# Build103: tiny JNI bridge for POSIX_FADV_DONTNEED.\nadd_library(hyperosmemory SHARED hyperos_memory_jni.cpp)\n`;
 }
 fs.writeFileSync(cmakePath, cmake, 'utf8');
+
+// Keep an app-local mirror only for deterministic workflow inspection. The
+// actual compiled source remains next to the CMake entry resolved above.
+const mirrorDir = 'android/app/src/main/jni';
+fs.mkdirSync(mirrorDir, { recursive: true });
+fs.writeFileSync(path.join(mirrorDir, 'hyperos_memory_jni.cpp'), cpp, 'utf8');
+fs.writeFileSync(
+  'android/app/build103-cmake-target.txt',
+  'add_library(hyperosmemory SHARED hyperos_memory_jni.cpp)\n',
+  'utf8'
+);
 
 const finalWorker = fs.readFileSync(workerPath, 'utf8');
 const finalCmake = fs.readFileSync(cmakePath, 'utf8');
