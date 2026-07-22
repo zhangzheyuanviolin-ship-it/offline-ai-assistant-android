@@ -65,4 +65,137 @@ replaceRequired(
   'Q8 K 缓存、F16 V 缓存、mmap、no_extra_bufts 和 1.5 GB 内存保护'
 );
 
-console.log('[build22] model load, completion, stop and release routed to :inference');
+const injector = 'scripts/inject-real-inference-process.mjs';
+replaceRequired(injector, "import com.facebook.react.ReactApplication\\n", '');
+replaceRequired(injector, "import com.facebook.react.modules.core.DeviceEventManagerModule\\n", '');
+replaceRequired(injector, '    const val EVENT_COMMAND = "OfflineInferenceCommand"\\n', '');
+replaceRequired(
+  injector,
+  `  private fun emitCommand(json: String) {
+    val app = application as ReactApplication
+    val reactContext = app.reactNativeHost.reactInstanceManager.currentReactContext
+    if (reactContext == null) {
+      queuedCommands.addFirst(json)
+      workerReady = false
+      return
+    }
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit(EVENT_COMMAND, json)
+  }`,
+  `  private fun emitCommand(json: String) {
+    InferenceWorkerBridgeModule.enqueueCommand(json)
+  }`
+);
+
+const oldWorkerModule = `const workerModuleSource = \`package \${packageName}
+
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReactMethod
+
+class InferenceWorkerBridgeModule(
+  context: ReactApplicationContext
+) : ReactContextBaseJavaModule(context) {
+  override fun getName(): String = "InferenceWorkerBridge"
+
+  @ReactMethod
+  fun ready() {
+    InferenceProcessService.markWorkerReady()
+  }
+
+  @ReactMethod
+  fun emit(requestId: String, type: String, payloadJson: String) {
+    InferenceProcessService.dispatchToClient(requestId, type, payloadJson)
+  }
+
+  @ReactMethod fun addListener(eventName: String) {}
+  @ReactMethod fun removeListeners(count: Double) {}
+}
+\`;`;
+
+const newWorkerModule = `const workerModuleSource = \`package \${packageName}
+
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReactMethod
+
+class InferenceWorkerBridgeModule(
+  context: ReactApplicationContext
+) : ReactContextBaseJavaModule(context) {
+  companion object {
+    @Volatile private var instance: InferenceWorkerBridgeModule? = null
+
+    fun enqueueCommand(json: String) {
+      val module = instance
+        ?: throw IllegalStateException("独立推理 WorkerBridge 尚未初始化")
+      module.deliverCommand(json)
+    }
+  }
+
+  private val queuedCommands = ArrayDeque<String>()
+  private var waitingPromise: Promise? = null
+
+  init {
+    instance = this
+  }
+
+  override fun getName(): String = "InferenceWorkerBridge"
+
+  private fun deliverCommand(json: String) {
+    val waiter = waitingPromise
+    if (waiter != null) {
+      waitingPromise = null
+      waiter.resolve(json)
+    } else {
+      queuedCommands.addLast(json)
+    }
+  }
+
+  @ReactMethod
+  fun ready() {
+    InferenceProcessService.markWorkerReady()
+  }
+
+  @ReactMethod
+  fun waitForCommand(promise: Promise) {
+    if (queuedCommands.isNotEmpty()) {
+      promise.resolve(queuedCommands.removeFirst())
+      return
+    }
+    waitingPromise?.reject(
+      "INFERENCE_WORKER_WAITER_REPLACED",
+      "独立推理进程出现重复命令等待器"
+    )
+    waitingPromise = promise
+  }
+
+  @ReactMethod
+  fun emit(requestId: String, type: String, payloadJson: String) {
+    InferenceProcessService.dispatchToClient(requestId, type, payloadJson)
+  }
+
+  override fun invalidate() {
+    waitingPromise?.reject(
+      "INFERENCE_WORKER_INVALIDATED",
+      "独立推理 WorkerBridge 已失效"
+    )
+    waitingPromise = null
+    queuedCommands.clear()
+    if (instance === this) instance = null
+    super.invalidate()
+  }
+
+  @ReactMethod fun addListener(eventName: String) {}
+  @ReactMethod fun removeListeners(count: Double) {}
+}
+\`;`;
+replaceRequired(injector, oldWorkerModule, newWorkerModule);
+
+const patchedInjector = fs.readFileSync(injector, 'utf8');
+if (patchedInjector.includes('currentReactContext') || !patchedInjector.includes('waitForCommand')) {
+  throw new Error('[build95] native command queue patch invariant failed');
+}
+
+console.log('[build22/build95] model routing and native Promise command queue prepared');
