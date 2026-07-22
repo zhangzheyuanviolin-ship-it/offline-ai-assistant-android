@@ -2,7 +2,7 @@ name: Build Signed Android APK
 
 on:
   push:
-    branches: [main, agent/build19-diagnostics-stability]
+    branches: [main, agent/build19-diagnostics-stability, agent/build20-tools-thinking-large-models]
   workflow_dispatch:
     inputs:
       version_name:
@@ -44,6 +44,13 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+
+      - name: Apply build21 inference-process patch
+        run: |
+          node scripts/apply-build21-inference-process-patches.mjs
+          grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
+          grep -F "InferenceProcessService" scripts/inject-external-model-native.mjs
+          grep -F 'android:process=":inference"' scripts/inject-external-model-native.mjs
 
       - name: Validate architecture invariants
         run: |
@@ -100,14 +107,17 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - name: Inject Android path resolver and memory diagnostics
+      - name: Inject Android path resolver, memory diagnostics and inference process
         run: |
           node scripts/inject-external-model-native.mjs
           grep -R -F "class ExternalModelFileModule" android/app/src/main/java
           grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
+          grep -R -F "class InferenceProcessService" android/app/src/main/java
+          grep -R -F "class InferenceProcessModule" android/app/src/main/java
           grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
           grep -R -F "Os.readlink" android/app/src/main/java
           grep -R -F "getHistoricalProcessExitReasons" android/app/src/main/java
+          grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
       - name: Decode and place keystore
         run: |
@@ -195,15 +205,11 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Streaming, model-path and memory-safety build
-            - Streams reasoning and final content into separate regions using throttled replacement snapshots.
-            - Keeps completed accessibility chunks stable and updates only a bounded tail node.
-            - Disables continuous auto-scroll during generation when a screen reader is enabled.
-            - Validates direct external imports as real readable filesystem paths before indexing them.
-            - Uses copy import for providers that expose only content streams or proxy file descriptors.
-            - Adds Q8/Q4 KV cache controls, no_extra_bufts and an effective reload flow for the 30B preset.
-            - Stops generation and preserves partial output when Android reports critical memory pressure.
-            - Exposes current process memory and the previous Android process-exit reason.
+            ## Build 21: inference-process experiment
+            - Fixes the CPU MoE preset by using Q8 K cache with F16 V cache while flash attention is disabled.
+            - Adds a non-exported Android service hosted in the dedicated `:inference` process.
+            - Adds React Native IPC lifecycle plumbing for starting and stopping the inference process.
+            - Preserves the existing streaming, tool-calling, external model path and memory diagnostics behavior.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
