@@ -14,3 +14,4 @@ Build118 therefore:
 3. Adds complete JSONL log sharing.
 4. Records before/after PSS around reclaim operations.
 5. Keeps stronger mapped-page reclaim behind the explicitly enabled experiment.
+6. Mirrors every signed-build source marker in the lightweight PR validation before dispatch.
