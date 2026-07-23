@@ -23,14 +23,29 @@ jobs:
           node --check scripts/inject-build118-evidence-native.mjs
 
       - name: Execute Build118 source patches
+        id: build118_patch
         run: |
-          node scripts/apply-build22-real-inference-process.mjs
-          node scripts/apply-build98-hyperos-memory.mjs
-          node scripts/apply-build118-low-residency-evidence.mjs
-          grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
-          grep -F 'Share.share' "app/(tabs)/settings.tsx"
-          grep -F 'performLowResidencyDrop' lib/services/inference-worker.ts
-          grep -F 'getInferenceDiagnosticLog' lib/services/runtime-memory.ts
+          set +e
+          {
+            node scripts/apply-build22-real-inference-process.mjs
+            node scripts/apply-build98-hyperos-memory.mjs
+            node scripts/apply-build118-low-residency-evidence.mjs
+            grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
+            grep -F 'Share.share' "app/(tabs)/settings.tsx"
+            grep -F 'performLowResidencyDrop' lib/services/inference-worker.ts
+            grep -F 'getInferenceDiagnosticLog' lib/services/runtime-memory.ts
+          } > build118-patch.log 2>&1
+          status=$?
+          cat build118-patch.log
+          exit $status
+
+      - name: Upload Build118 patch failure
+        if: failure() && steps.build118_patch.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build118-patch-error
+          path: build118-patch.log
+          retention-days: 7
 
   dispatch:
     needs: validate
