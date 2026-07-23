@@ -56,8 +56,6 @@ if (!java.includes('loadedLib.replace("rnllama_jni", "rnllama")')) {
 }
 fs.writeFileSync(javaPath, java, 'utf8');
 
-// v2 inserts the foreground-service code before deciding whether the Build
-// import is necessary. Ensure the generated Kotlin module has the import.
 const javaRoot = 'android/app/src/main/java';
 function findFile(dir, name) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -69,6 +67,9 @@ function findFile(dir, name) {
   }
   return null;
 }
+
+// v2 inserts the foreground-service code before deciding whether the Build
+// import is necessary. Ensure the generated Kotlin module has the import.
 const modulePath = findFile(javaRoot, 'InferenceProcessModule.kt');
 if (!modulePath) throw new Error('[build153-native-v3] InferenceProcessModule.kt missing');
 let module = fs.readFileSync(modulePath, 'utf8');
@@ -80,11 +81,27 @@ if (!module.includes('import android.os.Build\n')) {
 }
 fs.writeFileSync(modulePath, module, 'utf8');
 
+// Kotlin's Sequence API does not expose takeLast. Build152 carried a workflow-
+// local hotfix; make it deterministic in the native injector so clean source
+// builds compile without relying on an ad-hoc CI replacement.
+const workerPath = findFile(javaRoot, 'InferenceWorkerBridgeModule.kt');
+if (!workerPath) throw new Error('[build153-native-v3] InferenceWorkerBridgeModule.kt missing');
+let worker = fs.readFileSync(workerPath, 'utf8');
+worker = worker.replace(
+  'lines.filter { it.isNotBlank() }.takeLast(200).joinToString("\\n")',
+  'lines.filter { it.isNotBlank() }.toList().takeLast(200).joinToString("\\n")'
+);
+if (!worker.includes('toList().takeLast(200)')) {
+  throw new Error('[build153-native-v3] Kotlin diagnostic rollover fix missing');
+}
+fs.writeFileSync(workerPath, worker, 'utf8');
+
 for (const [file, markers] of [
   [androidCmakePath, ['Snapdragon 8 Gen 3 production target', 'rnllama_jni_v8_2_dotprod_i8mm']],
   [coreCmakePath, ['Snapdragon 8 Gen 3 production target', 'rnllama_v8_2_dotprod_i8mm']],
   [javaPath, ['loadedLib.replace("rnllama_jni", "rnllama")']],
   [modulePath, ['import android.os.Build', 'startForegroundService']],
+  [workerPath, ['toList().takeLast(200)']],
 ]) {
   const text = fs.readFileSync(file, 'utf8');
   for (const marker of markers) {
