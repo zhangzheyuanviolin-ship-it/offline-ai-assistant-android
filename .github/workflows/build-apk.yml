@@ -2,16 +2,20 @@ name: Build Signed Android APK
 
 on:
   push:
-    branches: [main, agent/build19-diagnostics-stability]
+    branches: [main, agent/build19-diagnostics-stability, agent/build20-tools-thinking-large-models]
   workflow_dispatch:
     inputs:
       version_name:
-        description: 'Version name (e.g. 1.0.1)'
+        description: 'Version name'
         required: false
         default: '1.0.0'
 
 permissions:
   contents: write
+
+concurrency:
+  group: signed-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -32,14 +36,61 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+
+      - name: Apply real inference-process routing
+        run: |
+          node scripts/apply-build22-real-inference-process.mjs
+          grep -F '"main": "index.js"' package.json
+          grep -F 'createRemoteLlamaContext' lib/services/model-service.ts
+          grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
+          grep -F "registerHeadlessTask('OfflineInferenceWorker'" index.js
+
+      - name: Validate architecture invariants
+        run: |
+          grep -F "AccessibilityStreamingText" "app/(tabs)/index.tsx"
+          grep -F "onStream" "lib/services/inference-orchestrator.ts"
+          grep -F "role: 'tool'" "lib/services/inference-orchestrator.ts"
+          grep -F "tool_calls: nativeCalls" "lib/services/inference-orchestrator.ts"
+          grep -F "resolveExternalModelUri" "lib/services/model-service.ts"
+          grep -F "memoryGuardTriggered" "lib/services/model-service.ts"
+          grep -F "activeModelId: nativeModelId" "lib/store.ts"
+          grep -F "保存并立即重新加载" "app/(tabs)/settings.tsx"
+          if grep -E "本轮已生成|MAX_TOOL_ROUNDS|createPushToken|pusher\.|setStreamContent" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
+            echo "Legacy cumulative streaming or fixed tool cap remains" >&2
+            exit 1
+          fi
+          if grep -F "data.content ?? data.token" "app/(tabs)/index.tsx" "lib/services/inference-orchestrator.ts"; then
+            echo "Accumulated content is still being appended as an incremental token" >&2
+            exit 1
+          fi
+
+      - name: TypeScript validation
+        id: typecheck
+        run: |
+          set +e
+          pnpm check > typecheck.log 2>&1
+          status=$?
+          cat typecheck.log
+          if [ $status -ne 0 ]; then
+            cp typecheck.log typecheck-error.txt
+            exit $status
+          fi
+
+      - name: Upload TypeScript error
+        if: failure() && steps.typecheck.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-inference-typecheck-error
+          path: typecheck-error.txt
+          retention-days: 7
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -51,25 +102,37 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Expo prebuild (Android)
+      - name: Expo prebuild Android
         run: npx expo prebuild --platform android --clean --no-install
         env:
           EXPO_NO_TELEMETRY: 1
+
+      - name: Inject Android native bridges and isolated inference service
+        run: |
+          node scripts/inject-external-model-native.mjs
+          node scripts/inject-real-inference-process.mjs
+          grep -R -F "class ExternalModelFileModule" android/app/src/main/java
+          grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
+          grep -R -F "class InferenceProcessService" android/app/src/main/java
+          grep -R -F "class InferenceProcessModule" android/app/src/main/java
+          grep -R -F "class InferenceWorkerBridgeModule" android/app/src/main/java
+          grep -R -F "InferenceWorkerBridgeModule(reactContext)" android/app/src/main/java
+          grep -R -F "HeadlessJsTaskService" android/app/src/main/java
+          grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
+          grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
       - name: Decode and place keystore
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/offline-ai-assistant.keystore
           ls -lh android/app/offline-ai-assistant.keystore
 
-      - name: Configure signing in build.gradle
+      - name: Configure signing
         run: |
           python3 - << 'PYEOF'
           import re
-
-          with open('android/app/build.gradle', 'r') as f:
-              content = f.read()
-
-          signing_config = """
+          path = 'android/app/build.gradle'
+          content = open(path, 'r', encoding='utf-8').read()
+          signing_config = '''
               signingConfigs {
                   release {
                       storeFile file("offline-ai-assistant.keystore")
@@ -78,54 +141,57 @@ jobs:
                       keyPassword System.getenv("ANDROID_KEY_PASSWORD")
                   }
               }
-          """
-
+          '''
           if 'signingConfigs' not in content:
               content = content.replace('    buildTypes {', signing_config + '    buildTypes {')
-
-          content = re.sub(
-              r'(buildTypes\s*\{[^}]*release\s*\{)',
-              r'\1\n            signingConfig signingConfigs.release',
-              content,
-              count=1
-          )
-
-          with open('android/app/build.gradle', 'w') as f:
-              f.write(content)
-
-          print("Signing config injected successfully")
+          content = re.sub(r'(buildTypes\s*\{[^}]*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
+          open(path, 'w', encoding='utf-8').write(content)
           PYEOF
 
       - name: Build release APK
+        id: gradle_build
         run: |
+          set +e
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease \
             --no-daemon \
             -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g" \
             -Dorg.gradle.parallel=true \
-            -Dorg.gradle.caching=true
+            -Dorg.gradle.caching=true \
+            > ../gradle-build.log 2>&1
+          status=$?
+          cd ..
+          tail -240 gradle-build.log
+          if [ $status -ne 0 ]; then
+            cp gradle-build.log gradle-build-error.txt
+            exit $status
+          fi
         env:
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      - name: Rename and move APK
+      - name: Upload native build error
+        if: failure() && steps.gradle_build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-inference-native-build-error
+          path: gradle-build-error.txt
+          retention-days: 7
+
+      - name: Rename and verify APK
         run: |
           VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
           BUILD_NUM="${{ github.run_number }}"
           APK_NAME="OfflineAIAssistant-v${VERSION}-build${BUILD_NUM}.apk"
-
           APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
-          if [ -z "$APK_SRC" ]; then
-            APK_SRC=$(find android -name "*.apk" -not -path "*/intermediates/*" | head -1)
-          fi
-
-          echo "Source APK: $APK_SRC"
+          test -n "$APK_SRC"
           mkdir -p dist
           cp "$APK_SRC" "dist/$APK_NAME"
           echo "APK_NAME=$APK_NAME" >> $GITHUB_ENV
           echo "APK_PATH=dist/$APK_NAME" >> $GITHUB_ENV
+          sha256sum "dist/$APK_NAME" | tee dist/SHA256SUMS.txt
           ls -lh "dist/$APK_NAME"
 
       - name: Upload APK artifact
@@ -141,15 +207,11 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant build19 diagnostic release
-
-            - Native prefill and decode timing is appended to each response.
-            - Duplicate final user prompts are removed before inference.
-            - Model contexts cannot be released or replaced during generation.
-            - Tool-call JSON is no longer cut off by conflicting stop strings.
-            - Persisted model state is synchronized with the native llama context.
-            - Unimplemented media processing is disabled by default.
-            - `no_extra_bufts` remains unchanged for direct comparison with build18.
+            ## Build 22: real isolated llama.rn inference
+            - Loads GGUF models inside the dedicated Android `:inference` process.
+            - Runs completion, streaming callbacks, stop and release through Messenger IPC.
+            - Keeps the React Native UI in the main process so model PSS is separated from UI PSS.
+            - Fixes the CPU MoE preset with Q8 K cache and F16 V cache while flash attention is disabled.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
@@ -158,6 +220,6 @@ jobs:
 
       - name: Build Summary
         run: |
-          echo "## ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Successful" >> $GITHUB_STEP_SUMMARY
           echo "**APK**: \`${{ env.APK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Download from [Releases](https://github.com/zhangzheyuanviolin-ship-it/offline-ai-assistant-android/releases)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY

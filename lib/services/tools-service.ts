@@ -115,34 +115,83 @@ export interface ParsedToolCall {
   raw: string;
 }
 
-export function parseToolCalls(text: string): ParsedToolCall[] {
-  const results: ParsedToolCall[] = [];
-  const patterns = [
-    /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g,
-    /(\{[^{}]*"t"\s*:\s*"[^"]+[^{}]*\})/g,
-    /(\{[^{}]*"tool"\s*:\s*"[^"]+[^{}]*\})/g,
-  ];
-  const seen = new Set<string>();
+const BUILD20_TOOLS_READY = true;
 
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const raw = match[1] ?? match[0];
-      if (seen.has(raw)) continue;
-      seen.add(raw);
-      try {
-        const parsed = JSON.parse(raw);
-        if (typeof parsed.t === 'string') {
-          const tool = ALL_TOOLS.find((t) => t.name === parsed.t);
-          if (tool) results.push({ toolName: parsed.t, parameters: (parsed.p && typeof parsed.p === 'object') ? parsed.p : {}, raw });
-        } else if (typeof parsed.tool === 'string') {
-          const tool = ALL_TOOLS.find((t) => t.name === parsed.tool);
-          if (tool) results.push({ toolName: parsed.tool, parameters: parsed.parameters ?? parsed.args ?? parsed.params ?? {}, raw });
-        }
-      } catch { /* ignore */ }
+function extractBalancedJsonObjects(text: string): string[] {
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') { if (depth === 0) start = i; depth += 1; }
+    else if (ch === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) { objects.push(text.slice(start, i + 1)); start = -1; }
     }
   }
+  return objects;
+}
+
+function normalizeToolCall(parsed: unknown, raw: string): ParsedToolCall | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const value = parsed as Record<string, unknown>;
+  const fn = value.function && typeof value.function === 'object' ? value.function as Record<string, unknown> : null;
+  const toolName = typeof value.t === 'string' ? value.t
+    : typeof value.tool === 'string' ? value.tool
+    : typeof value.name === 'string' ? value.name
+    : typeof fn?.name === 'string' ? fn.name : '';
+  if (!toolName || !ALL_TOOLS.some((tool) => tool.name === toolName)) return null;
+  let parameters: unknown = value.p ?? value.parameters ?? value.arguments ?? value.args ?? fn?.arguments ?? {};
+  if (typeof parameters === 'string') {
+    try { parameters = JSON.parse(parameters); } catch { return null; }
+  }
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) parameters = {};
+  return { toolName, parameters: parameters as Record<string, unknown>, raw };
+}
+
+export function parseToolCalls(text: string): ParsedToolCall[] {
+  const results: ParsedToolCall[] = [];
+  const seen = new Set<string>();
+  for (const raw of extractBalancedJsonObjects(text)) {
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    try {
+      const call = normalizeToolCall(JSON.parse(raw), raw);
+      if (call) results.push(call);
+    } catch { /* prose braces are ignored */ }
+  }
   return results;
+}
+
+export function buildNativeTools(toolsConfig: ToolsConfig): Array<Record<string, unknown>> {
+  return getAvailableTools(toolsConfig).map((tool) => {
+    const requiredEntries = Object.entries(tool.params).filter(([, spec]) => spec.req);
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.desc,
+        parameters: {
+          type: 'object',
+          properties: Object.fromEntries(requiredEntries.map(([name, spec]) => [name, {
+            type: spec.t === 'int' ? 'integer' : spec.t === 'bool' ? 'boolean' : spec.t === 'obj' ? 'object' : 'string',
+            description: spec.d,
+          }])),
+          required: requiredEntries.map(([name]) => name),
+          additionalProperties: false,
+        },
+      },
+    };
+  });
 }
 
 // ─── Tool Helpers ─────────────────────────────────────────────────────────────
@@ -352,38 +401,95 @@ async function searchExa(
  * DuckDuckGo HTML 抓取（无需 API Key）
  * 使用 html.duckduckgo.com（lite 版），正则更宽松以提高命中率。
  */
+const BUILD41_TOOL_ADAPTERS = true;
+
+function decodeHtmlText(input: string): string {
+  return input
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;|&#34;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function decodeDuckDuckGoLink(raw: string): string {
+  let link = raw.replace(/&amp;/g, '&');
+  if (link.startsWith('//')) link = 'https:' + link;
+  const redirected = link.match(/[?&]uddg=([^&]+)/i)?.[1];
+  if (redirected) {
+    try { return decodeURIComponent(redirected); } catch { return redirected; }
+  }
+  return link;
+}
+
+function parseDuckDuckGoHtml(html: string, maxResults: number): Array<{ title: string; url: string; content: string }> {
+  const results: Array<{ title: string; url: string; content: string }> = [];
+  const seen = new Set<string>();
+  const anchor = /<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = anchor.exec(html)) !== null && results.length < maxResults) {
+    const url = decodeDuckDuckGoLink(match[1]);
+    const title = decodeHtmlText(match[2]);
+    if (!/^https?:\/\//i.test(url) || title.length < 3 || seen.has(url)) continue;
+    const nearby = html.slice(match.index, Math.min(html.length, match.index + 2400));
+    const snippetMatch = nearby.match(/<(?:a|div)[^>]+class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+    const snippet = snippetMatch ? decodeHtmlText(snippetMatch[1]) : '';
+    if (/\$\{|\{\{|template|placeholder/i.test(title + ' ' + snippet)) continue;
+    seen.add(url);
+    results.push({ title: title.slice(0, 180), url, content: snippet.slice(0, 800) });
+  }
+  return results;
+}
+
 async function searchDuckDuckGo(
   query: string,
   maxResults: number
 ): Promise<Array<{ title: string; url: string; content: string }>> {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const resp = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    },
-  });
-  const html = await resp.text();
-  const results: Array<{ title: string; url: string; content: string }> = [];
-  // DDG HTML 的结果在 result__a / result__url 结构中，但为了健壮，匹配所有外链 <a>
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null && results.length < maxResults) {
-    const link = m[1];
-    const title = m[2].replace(/<[^>]+>/g, '').trim();
-    if (!link.includes('duckduckgo.com') && title.length >= 4) {
-      results.push({ title: title.substring(0, 120), url: link, content: '' });
+  const attempts: Array<() => Promise<Response>> = [
+    () => fetch('https://html.duckduckgo.com/html/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      },
+      body: `q=${encodeURIComponent(query)}`,
+    }),
+    () => fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      },
+    }),
+  ];
+
+  let lastError = '';
+  for (const attempt of attempts) {
+    try {
+      const response = await attempt();
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const html = await response.text();
+      if (html.length < 500 || /captcha|anomaly-modal|verify you are human/i.test(html)) {
+        throw new Error('搜索页面被拦截或返回空模板');
+      }
+      const parsed = parseDuckDuckGoHtml(html, maxResults);
+      if (parsed.length > 0) return parsed;
+      lastError = '页面返回成功，但没有解析到有效结果';
+    } catch (error) {
+      lastError = String(error);
     }
   }
-  // Fallback：宽松匹配
-  if (results.length === 0) {
-    const re2 = /<a[^>]+href="(https?:\/\/(?!duckduckgo)[^"]+)"[^>]*>([^<]{6,})<\/a>/gi;
-    while ((m = re2.exec(html)) !== null && results.length < maxResults) {
-      results.push({ title: m[2].trim().substring(0, 120), url: m[1], content: '' });
-    }
-  }
-  return results;
+  throw new Error(`DuckDuckGo 搜索失败：${lastError}`);
 }
 
 /**
@@ -432,75 +538,72 @@ async function execWebSearchTool(
   const ts = Date.now();
   if (name !== 'search') return { toolName: name, success: false, error: `未知搜索工具: ${name}`, timestamp: ts };
 
-  const query = p.q as string;
-  const maxResults = Math.max(1, Math.min(20, (p.n as number) || toolsConfig.WebSearch.maxResults || 5));
-  let engine: SearchEngine = toolsConfig.WebSearch.engine;
+  const query = String(p.q ?? '').trim();
+  if (!query) return { toolName: name, success: false, error: '搜索关键词不能为空', timestamp: ts };
+  const maxResults = Math.max(1, Math.min(20, toolsConfig.WebSearch.maxResults || 5));
+  const engine: SearchEngine = toolsConfig.WebSearch.engine;
 
   try {
     let rawResults: Array<{ title: string; url: string; content: string; score?: number }>;
-
-    try {
-      switch (engine) {
-        case 'tavily':
-          rawResults = await searchTavily(query, maxResults, toolsConfig.WebSearch.tavilyApiKey);
-          break;
-        case 'exa':
-          rawResults = await searchExa(query, maxResults, toolsConfig.WebSearch.exaApiKey);
-          break;
-        case 'baidu':
-          rawResults = await searchBaidu(query, maxResults);
-          // 百度解析失败（0 条）→ 自动 fallback 到 DuckDuckGo，确保模型有结果可用
-          if (rawResults.length === 0) {
-            rawResults = await searchDuckDuckGo(query, maxResults);
-            engine = 'duckduckgo';
-          }
-          break;
-        case 'duckduckgo':
-        default:
-          rawResults = await searchDuckDuckGo(query, maxResults);
-          // DDG 也失败 → 尝试百度
-          if (rawResults.length === 0) {
-            rawResults = await searchBaidu(query, maxResults);
-            if (rawResults.length > 0) engine = 'baidu';
-          }
-          break;
-      }
-    } catch (engineErr) {
-      // 当前引擎失败 → 自动 fallback 到 DuckDuckGo
-      if (engine !== 'duckduckgo') {
+    switch (engine) {
+      case 'tavily':
+        rawResults = await searchTavily(query, maxResults, toolsConfig.WebSearch.tavilyApiKey);
+        break;
+      case 'exa':
+        rawResults = await searchExa(query, maxResults, toolsConfig.WebSearch.exaApiKey);
+        break;
+      case 'baidu':
+        rawResults = await searchBaidu(query, maxResults);
+        break;
+      case 'duckduckgo':
+      default:
         rawResults = await searchDuckDuckGo(query, maxResults);
-        engine = 'duckduckgo';
-      } else {
-        throw engineErr;
-      }
+        break;
     }
 
-    // 统一格式化结果（极简，节省 token）
-    const results = rawResults.slice(0, maxResults).map((r, i) => ({
-      i: i + 1,
-      title: r.title.substring(0, 80),
-      url: r.url,
-      snippet: r.content ? r.content.substring(0, 200) : '',
-    }));
+    const htmlEngine = engine === 'duckduckgo' || engine === 'baidu';
+    const results = rawResults
+      .slice(0, maxResults)
+      .map((item, index) => ({
+        i: index + 1,
+        title: htmlEngine ? decodeHtmlText(String(item.title ?? '')).slice(0, 180) : String(item.title ?? '').trim().slice(0, 180),
+        url: String(item.url ?? '').replace(/&amp;/g, '&'),
+        snippet: htmlEngine ? decodeHtmlText(String(item.content ?? '')).slice(0, 800) : String(item.content ?? '').trim().slice(0, 1200),
+        score: item.score,
+      }))
+      .filter((item) => item.title.length >= 3 && /^https?:\/\//i.test(item.url))
+      .filter((item) => !htmlEngine || !/\$\{|\{\{|template|placeholder/i.test(item.title + ' ' + item.snippet));
 
     if (results.length === 0) {
-      return {
-        toolName: name,
-        success: false,
-        error: `${engine} 搜索未返回结果，请尝试更换关键词或检查网络`,
-        timestamp: ts,
-      };
+      return { toolName: name, success: false, error: `${engine} 没有返回可用结果`, timestamp: ts };
     }
+
+    const text = [
+      `搜索关键词：${query}`,
+      `搜索引擎：${engine}，结果：${results.length} 条`,
+      ...results.map((item) => [
+        `${item.i}. ${item.title}`,
+        item.snippet ? `摘要：${item.snippet}` : '摘要：该搜索源未提供摘要。',
+        `链接：${item.url}`,
+      ].join('\n')),
+    ].join('\n\n');
 
     return {
       toolName: name,
       success: true,
-      data: { query, engine, count: results.length, results },
+      data: { query, engine, count: results.length, results, text },
       timestamp: ts,
     };
-  } catch (e) {
-    return { toolName: name, success: false, error: `搜索失败(${engine}): ${String(e)}`, timestamp: ts };
+  } catch (error) {
+    return { toolName: name, success: false, error: `搜索失败(${engine}): ${String(error)}`, timestamp: ts };
   }
+}
+
+export function formatToolResultForModel(result: ToolResult): string {
+  if (!result.success) return `错误：${result.error ?? '工具执行失败'}`;
+  const data = result.data as { text?: unknown } | undefined;
+  if (data && typeof data.text === 'string' && data.text.trim()) return data.text;
+  try { return JSON.stringify(result.data ?? {}); } catch { return String(result.data ?? ''); }
 }
 
 // ─── Main Executor ────────────────────────────────────────────────────────────
