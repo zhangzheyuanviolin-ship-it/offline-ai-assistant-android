@@ -122,41 +122,28 @@ jobs:
           EXPO_NO_TELEMETRY: 1
 
       - name: Inject Android native bridges and Build118 diagnostics
+        id: native_inject
         run: |
-          node scripts/inject-external-model-native.mjs
-          node scripts/inject-real-inference-process.mjs
-          node scripts/inject-build98-memory-native.mjs
-          node scripts/inject-build103-posix-native.mjs
-          node scripts/inject-build118-evidence-native.mjs
-          python3 - << 'PYEOF'
-          from pathlib import Path
-          for path in Path('android/app/src/main/java').rglob('InferenceWorkerBridgeModule.kt'):
-              text = path.read_text(encoding='utf-8')
-              text = text.replace(
-                  'lines.filter { it.isNotBlank() }.takeLast(200).joinToString("\\n")',
-                  'lines.filter { it.isNotBlank() }.toList().takeLast(200).joinToString("\\n")'
-              )
-              path.write_text(text, encoding='utf-8')
-          PYEOF
-          grep -R -F "class ExternalModelFileModule" android/app/src/main/java
-          grep -R -F "class RuntimeMemoryModule" android/app/src/main/java
-          grep -R -F "class InferenceProcessService" android/app/src/main/java
-          grep -R -F "class InferenceProcessModule" android/app/src/main/java
-          grep -R -F "class InferenceWorkerBridgeModule" android/app/src/main/java
-          grep -R -F "InferenceWorkerBridgeModule(reactContext)" android/app/src/main/java
-          grep -R -F "HeadlessJsTaskService" android/app/src/main/java
-          grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
-          grep -R -F "System.loadLibrary(\"hyperosmemory\")" android/app/src/main/java
-          grep -R -F "nativeDropFileCache(descriptor.fd, modelFile.absolutePath)" android/app/src/main/java
-          grep -R -F "info.processName.endsWith(\":inference\")" android/app/src/main/java
-          grep -R -F "getInferenceDiagnosticLog" android/app/src/main/java
-          grep -R -F "Pss_File" android/app/src/main/java
-          grep -R -F "toList().takeLast(200)" android/app/src/main/java
-          grep -R -F "add_library(hyperosmemory SHARED hyperos_memory_jni.cpp)" android/app
-          grep -R -F "madvise(" android/app/src/main/jni android/app/src/main/cpp 2>/dev/null
-          grep -R -F "/proc/self/maps" android/app/src/main/jni android/app/src/main/cpp 2>/dev/null
-          test -n "$(find android/app -name hyperos_memory_jni.cpp -print -quit)"
-          grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
+          set +e
+          {
+            node scripts/inject-external-model-native.mjs
+            node scripts/inject-real-inference-process.mjs
+            node scripts/inject-build98-memory-native.mjs
+            node scripts/inject-build103-posix-native.mjs
+            node scripts/inject-build118-evidence-native.mjs
+            node scripts/verify-build118-generated-native.mjs
+          } > build118-native-inject.log 2>&1
+          status=$?
+          cat build118-native-inject.log
+          exit $status
+
+      - name: Upload Build118 native injection error
+        if: failure() && steps.native_inject.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build118-native-injection-error
+          path: build118-native-inject.log
+          retention-days: 7
 
       - name: Decode and place keystore
         run: |
