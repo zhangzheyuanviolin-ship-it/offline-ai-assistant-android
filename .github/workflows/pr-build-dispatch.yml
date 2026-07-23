@@ -21,6 +21,7 @@ jobs:
         run: |
           node --check scripts/apply-build118-low-residency-evidence.mjs
           node --check scripts/inject-build118-evidence-native.mjs
+          node --check scripts/verify-build118-source.mjs
 
       - name: Execute Build118 source patches
         id: build118_patch
@@ -30,10 +31,7 @@ jobs:
             node scripts/apply-build22-real-inference-process.mjs
             node scripts/apply-build98-hyperos-memory.mjs
             node scripts/apply-build118-low-residency-evidence.mjs
-            grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
-            grep -F 'Share.share' "app/(tabs)/settings.tsx"
-            grep -F 'performLowResidencyDrop' lib/services/inference-worker.ts
-            grep -F 'getInferenceDiagnosticLog' lib/services/runtime-memory.ts
+            node scripts/verify-build118-source.mjs
           } > build118-patch.log 2>&1
           status=$?
           cat build118-patch.log
