@@ -3,8 +3,6 @@
  * llama.rn 0.12.6 / llama.cpp b9982
  */
 
-// ─── Model Types ─────────────────────────────────────────────────────────────
-
 export interface AIModel {
   id: string;
   name: string;
@@ -14,13 +12,25 @@ export interface AIModel {
   format: 'gguf' | 'other';
   addedAt: number;
   isLoaded: boolean;
+  storageMode: 'copied' | 'external';
+  sourceUri?: string;
 }
+
+export type KVCacheType = 'f16' | 'q8_0' | 'q4_0';
 
 export interface InferenceParams {
   n_ctx: number;
   n_batch: number;
+  n_ubatch: number;
   n_threads: number;
   n_gpu_layers: number;
+  use_mmap: boolean;
+  use_mlock: boolean;
+  no_extra_bufts: boolean;
+  cache_type_k: KVCacheType;
+  cache_type_v: KVCacheType;
+  memory_guard_enabled: boolean;
+  memory_guard_reserve_mb: number;
   temperature: number;
   top_p: number;
   top_k: number;
@@ -32,8 +42,16 @@ export interface InferenceParams {
 export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
   n_ctx: 2048,
   n_batch: 256,
+  n_ubatch: 64,
   n_threads: 4,
   n_gpu_layers: 0,
+  use_mmap: true,
+  use_mlock: false,
+  no_extra_bufts: true,
+  cache_type_k: 'f16',
+  cache_type_v: 'f16',
+  memory_guard_enabled: true,
+  memory_guard_reserve_mb: 1024,
   temperature: 0.7,
   top_p: 0.9,
   top_k: 40,
@@ -41,8 +59,6 @@ export const DEFAULT_INFERENCE_PARAMS: InferenceParams = {
   max_tokens: 1024,
   stop: ['<|end|>', '</s>', '<|endoftext|>'],
 };
-
-// ─── Message Types ───────────────────────────────────────────────────────────
 
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
@@ -69,6 +85,7 @@ export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  reasoning?: string;
   timestamp: number;
   isStreaming?: boolean;
   toolCalls?: ToolCall[];
@@ -76,8 +93,6 @@ export interface ChatMessage {
   isActivity?: boolean;
   activityType?: 'thinking' | 'streaming' | 'tool_calling' | 'tool_done' | 'warning' | 'error';
 }
-
-// ─── Tool Types ──────────────────────────────────────────────────────────────
 
 export type ToolCategory = 'WebSearch' | 'Files' | 'Media';
 export type PermissionLevel = 'ALLOW' | 'ASK' | 'FORBID';
@@ -117,14 +132,11 @@ export const DEFAULT_TOOLS_CONFIG: ToolsConfig = {
     permissionLevel: 'ALLOW',
     dangerousPermission: 'ASK',
   },
-  // media_proc 尚未接入 FFmpeg，默认不向模型暴露不可执行工具。
   Media: {
     enabled: false,
     permissionLevel: 'FORBID',
   },
 };
-
-// ─── Log Types ───────────────────────────────────────────────────────────────
 
 export interface ToolLog {
   id: string;
