@@ -2,22 +2,26 @@ name: Build Signed Android APK
 
 on:
   push:
-    branches: [main, agent/build19-diagnostics-stability]
+    branches: [main, agent/build19-diagnostics-stability, agent/build20-tools-thinking-large-models, agent/build98-hyperos-memory-diagnostics, agent/build153-hyperos-demand-paging-foreground]
   workflow_dispatch:
     inputs:
       version_name:
-        description: 'Version name (e.g. 1.0.1)'
+        description: 'Version name'
         required: false
         default: '1.0.0'
 
 permissions:
   contents: write
 
+concurrency:
+  group: signed-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -32,44 +36,154 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Cache Gradle
+      - name: Apply Build153 production source fixes
+        id: source_patch
+        run: |
+          set +e
+          {
+            node --check scripts/apply-build153-production-mode.mjs
+            node --check scripts/inject-build153-engine-v2.mjs
+            node --check scripts/inject-build153-engine-v3.mjs
+            node scripts/apply-build22-real-inference-process.mjs
+            node scripts/apply-build98-hyperos-memory.mjs
+            node scripts/apply-build118-low-residency-evidence.mjs
+            node scripts/apply-build153-production-mode.mjs
+            grep -F 'Build153 production path' lib/services/inference-worker.ts
+            grep -F 'memory_diagnostics_enabled: false' lib/types.ts
+            grep -F 'low_residency_enabled: false' lib/store.ts
+            grep -F 'HyperOS 30B MoE 稳定模式' "app/(tabs)/settings.tsx"
+            if grep -F 'void performLowResidencyDrop(requestId, '\''stream'\'')' lib/services/inference-worker.ts; then
+              echo 'Legacy periodic cache-drop call remains' >&2
+              exit 1
+            fi
+          } > build153-source.log 2>&1
+          status=$?
+          cat build153-source.log
+          exit $status
+
+      - name: Upload Build153 source error
+        if: failure() && steps.source_patch.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build153-source-error
+          path: build153-source.log
+          retention-days: 7
+
+      - name: Validate architecture invariants
+        run: |
+          grep -F 'AccessibilityStreamingText' "app/(tabs)/index.tsx"
+          grep -F 'onStream' lib/services/inference-orchestrator.ts
+          grep -F "role: 'tool'" lib/services/inference-orchestrator.ts
+          grep -F 'tool_calls: nativeCalls' lib/services/inference-orchestrator.ts
+          grep -F 'resolveExternalModelUri' lib/services/model-service.ts
+          grep -F 'memoryGuardTriggered' lib/services/model-service.ts
+          grep -F 'activeModelId: nativeModelId' lib/store.ts
+          if grep -E '本轮已生成|MAX_TOOL_ROUNDS|createPushToken|pusher\.|setStreamContent' "app/(tabs)/index.tsx" lib/services/inference-orchestrator.ts; then
+            echo 'Legacy cumulative streaming or fixed tool cap remains' >&2
+            exit 1
+          fi
+          if grep -F 'data.content ?? data.token' "app/(tabs)/index.tsx" lib/services/inference-orchestrator.ts; then
+            echo 'Accumulated content is still appended as an incremental token' >&2
+            exit 1
+          fi
+
+      - name: TypeScript validation
+        id: typecheck
+        run: |
+          set +e
+          pnpm check > typecheck.log 2>&1
+          status=$?
+          cat typecheck.log
+          if [ $status -ne 0 ]; then
+            cp typecheck.log typecheck-error.txt
+            exit $status
+          fi
+
+      - name: Upload TypeScript error
+        if: failure() && steps.typecheck.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build153-typecheck-error
+          path: typecheck-error.txt
+          retention-days: 7
+
+      - name: Cache Gradle and native objects
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+            android/.cxx
+          key: ${{ runner.os }}-build153-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'scripts/inject-build153-engine-v*.mjs') }}
           restore-keys: |
+            ${{ runner.os }}-build153-
             ${{ runner.os }}-gradle-
 
-      - name: Expo prebuild (Android)
+      - name: Expo prebuild Android
         run: npx expo prebuild --platform android --clean --no-install
         env:
           EXPO_NO_TELEMETRY: 1
+
+      - name: Inject custom demand-paging engine and foreground service
+        id: native_inject
+        run: |
+          set +e
+          {
+            node scripts/inject-external-model-native.mjs
+            node scripts/inject-real-inference-process.mjs
+            node scripts/inject-build98-memory-native.mjs
+            node scripts/inject-build103-posix-native.mjs
+            node scripts/inject-build153-engine-v3.mjs
+            grep -F 'Build153 Android demand paging' node_modules/llama.rn/cpp/llama-model-loader.cpp
+            grep -F 'file.get(), 0, is_numa' node_modules/llama.rn/cpp/llama-model-loader.cpp
+            grep -F 'POSIX_FADV_RANDOM' node_modules/llama.rn/cpp/llama-mmap.cpp
+            grep -F 'Never use MAP_POPULATE' node_modules/llama.rn/cpp/llama-mmap.cpp
+            grep -F 'rnllamaBuildFromSource=true' android/gradle.properties
+            grep -F 'reactNativeArchitectures=arm64-v8a' android/gradle.properties
+            grep -F 'rnllama_jni_v8_2_dotprod_i8mm' node_modules/llama.rn/android/src/main/CMakeLists.txt
+            grep -F 'loadedLib.replace("rnllama_jni", "rnllama")' node_modules/llama.rn/android/src/main/java/com/rnllama/RNLlama.java
+            grep -R -F 'startForegroundService' android/app/src/main/java
+            grep -R -F 'BIND_ABOVE_CLIENT' android/app/src/main/java
+            grep -F 'foregroundServiceType="specialUse"' android/app/src/main/AndroidManifest.xml
+            grep -F 'PROPERTY_SPECIAL_USE_FGS_SUBTYPE' android/app/src/main/AndroidManifest.xml
+            if grep -F 'build_rnllama_library("rnllama"' node_modules/llama.rn/android/src/main/rnllama/CMakeLists.txt; then
+              echo 'Generic llama core target unexpectedly remains' >&2
+              exit 1
+            fi
+          } > build153-native-inject.log 2>&1
+          status=$?
+          cat build153-native-inject.log
+          exit $status
+
+      - name: Upload Build153 native injection error
+        if: failure() && steps.native_inject.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build153-native-injection-error
+          path: build153-native-inject.log
+          retention-days: 7
 
       - name: Decode and place keystore
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/offline-ai-assistant.keystore
           ls -lh android/app/offline-ai-assistant.keystore
 
-      - name: Configure signing in build.gradle
+      - name: Configure signing
         run: |
           python3 - << 'PYEOF'
           import re
-
-          with open('android/app/build.gradle', 'r') as f:
-              content = f.read()
-
-          signing_config = """
+          path = 'android/app/build.gradle'
+          content = open(path, 'r', encoding='utf-8').read()
+          signing_config = '''
               signingConfigs {
                   release {
                       storeFile file("offline-ai-assistant.keystore")
@@ -78,54 +192,59 @@ jobs:
                       keyPassword System.getenv("ANDROID_KEY_PASSWORD")
                   }
               }
-          """
-
+          '''
           if 'signingConfigs' not in content:
               content = content.replace('    buildTypes {', signing_config + '    buildTypes {')
-
-          content = re.sub(
-              r'(buildTypes\s*\{[^}]*release\s*\{)',
-              r'\1\n            signingConfig signingConfigs.release',
-              content,
-              count=1
-          )
-
-          with open('android/app/build.gradle', 'w') as f:
-              f.write(content)
-
-          print("Signing config injected successfully")
+          content = re.sub(r'(buildTypes\s*\{[^}]*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
+          open(path, 'w', encoding='utf-8').write(content)
           PYEOF
 
-      - name: Build release APK
+      - name: Build source-maintained release APK
+        id: gradle_build
         run: |
+          set +e
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease \
             --no-daemon \
+            -PrnllamaBuildFromSource=true \
+            -PreactNativeArchitectures=arm64-v8a \
             -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g" \
             -Dorg.gradle.parallel=true \
-            -Dorg.gradle.caching=true
+            -Dorg.gradle.caching=true \
+            > ../gradle-build.log 2>&1
+          status=$?
+          cd ..
+          tail -300 gradle-build.log
+          if [ $status -ne 0 ]; then
+            cp gradle-build.log gradle-build-error.txt
+            exit $status
+          fi
         env:
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      - name: Rename and move APK
+      - name: Upload native build error
+        if: failure() && steps.gradle_build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build153-native-build-error
+          path: gradle-build-error.txt
+          retention-days: 7
+
+      - name: Rename and verify APK
         run: |
           VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
           BUILD_NUM="${{ github.run_number }}"
           APK_NAME="OfflineAIAssistant-v${VERSION}-build${BUILD_NUM}.apk"
-
-          APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
-          if [ -z "$APK_SRC" ]; then
-            APK_SRC=$(find android -name "*.apk" -not -path "*/intermediates/*" | head -1)
-          fi
-
-          echo "Source APK: $APK_SRC"
+          APK_SRC=$(find android/app/build/outputs/apk/release -name '*.apk' | head -1)
+          test -n "$APK_SRC"
           mkdir -p dist
           cp "$APK_SRC" "dist/$APK_NAME"
           echo "APK_NAME=$APK_NAME" >> $GITHUB_ENV
           echo "APK_PATH=dist/$APK_NAME" >> $GITHUB_ENV
+          sha256sum "dist/$APK_NAME" | tee dist/SHA256SUMS.txt
           ls -lh "dist/$APK_NAME"
 
       - name: Upload APK artifact
@@ -141,15 +260,14 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Offline AI Assistant build19 diagnostic release
-
-            - Native prefill and decode timing is appended to each response.
-            - Duplicate final user prompts are removed before inference.
-            - Model contexts cannot be released or replaced during generation.
-            - Tool-call JSON is no longer cut off by conflicting stop strings.
-            - Persisted model state is synchronized with the native llama context.
-            - Unimplemented media processing is disabled by default.
-            - `no_extra_bufts` remains unchanged for direct comparison with build18.
+            ## Build153: custom HyperOS 30B MoE inference engine
+            - Builds llama.rn/llama.cpp from source instead of using the precompiled engine.
+            - Removes whole-GGUF MAP_POPULATE and MADV_WILLNEED loading on Android; expert weights are demand-paged.
+            - Replaces sequential file advice with random-access advice for MoE routing.
+            - Uses the Snapdragon 8 Gen 3 dotprod+i8mm CPU target.
+            - Runs the isolated inference process as an Android foreground special-use service with important binding.
+            - Retires per-token smaps diagnostics and periodic DONTNEED calls that caused multi-second output stalls.
+            - Automatically migrates old Build117/152 experimental settings back to the production path.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
@@ -158,6 +276,6 @@ jobs:
 
       - name: Build Summary
         run: |
-          echo "## ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
+          echo '## Build Successful' >> $GITHUB_STEP_SUMMARY
           echo "**APK**: \`${{ env.APK_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Download from [Releases](https://github.com/zhangzheyuanviolin-ship-it/offline-ai-assistant-android/releases)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
