@@ -45,18 +45,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Apply real inference-process routing and Build98 memory experiment
+      - name: Apply isolated inference routing and Build118 evidence fixes
         run: |
           node scripts/apply-build22-real-inference-process.mjs
           node scripts/apply-build98-hyperos-memory.mjs
+          node scripts/apply-build118-low-residency-evidence.mjs
           grep -F '"main": "index.js"' package.json
           grep -F 'createRemoteLlamaContext' lib/services/model-service.ts
           grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
           grep -F "registerHeadlessTask('OfflineInferenceWorker'" index.js
           grep -F 'low_residency_enabled' lib/types.ts
-          grep -F 'getLatestInferenceDiagnostic' lib/services/runtime-memory.ts
-          grep -F 'dropFileCache' lib/services/inference-worker.ts
-          grep -F 'HyperOS 低驻留实验预设' "app/(tabs)/settings.tsx"
+          grep -F 'getInferenceDiagnosticLog' lib/services/runtime-memory.ts
+          grep -F 'performLowResidencyDrop' lib/services/inference-worker.ts
+          grep -F 'low_residency_interval_tokens: 128' "app/(tabs)/settings.tsx"
+          grep -F '分享完整推理日志' "app/(tabs)/settings.tsx"
 
       - name: Validate architecture invariants
         run: |
@@ -112,12 +114,13 @@ jobs:
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - name: Inject Android native bridges, isolated inference service and Build98 diagnostics
+      - name: Inject Android native bridges and Build118 diagnostics
         run: |
           node scripts/inject-external-model-native.mjs
           node scripts/inject-real-inference-process.mjs
           node scripts/inject-build98-memory-native.mjs
           node scripts/inject-build103-posix-native.mjs
+          node scripts/inject-build118-evidence-native.mjs
           python3 - << 'PYEOF'
           from pathlib import Path
           for path in Path('android/app/src/main/java').rglob('InferenceWorkerBridgeModule.kt'):
@@ -137,12 +140,14 @@ jobs:
           grep -R -F "HeadlessJsTaskService" android/app/src/main/java
           grep -R -F "add(OfflineAiNativePackage())" android/app/src/main/java
           grep -R -F "System.loadLibrary(\"hyperosmemory\")" android/app/src/main/java
-          grep -R -F "nativeDropFileCache(descriptor.fd)" android/app/src/main/java
+          grep -R -F "nativeDropFileCache(descriptor.fd, modelFile.absolutePath)" android/app/src/main/java
+          grep -R -F "info.processName.endsWith(\":inference\")" android/app/src/main/java
+          grep -R -F "getInferenceDiagnosticLog" android/app/src/main/java
           grep -R -F "Pss_File" android/app/src/main/java
-          grep -R -F "getLatestInferenceDiagnostic" android/app/src/main/java
           grep -R -F "toList().takeLast(200)" android/app/src/main/java
           grep -R -F "add_library(hyperosmemory SHARED hyperos_memory_jni.cpp)" android/app
-          grep -R -F "POSIX_FADV_DONTNEED" android/app/src/main/jni android/app/src/main/cpp 2>/dev/null || true
+          grep -R -F "madvise(" android/app/src/main/jni android/app/src/main/cpp 2>/dev/null
+          grep -R -F "/proc/self/maps" android/app/src/main/jni android/app/src/main/cpp 2>/dev/null
           test -n "$(find android/app -name hyperos_memory_jni.cpp -print -quit)"
           grep -F 'android:process=":inference"' android/app/src/main/AndroidManifest.xml
 
@@ -232,12 +237,13 @@ jobs:
           tag_name: v${{ github.event.inputs.version_name || '1.0.0' }}-build${{ github.run_number }}
           name: "Offline AI Assistant v${{ github.event.inputs.version_name || '1.0.0' }} (Build ${{ github.run_number }})"
           body: |
-            ## Build 103: HyperOS PSS diagnostics and JNI low-residency experiment
-            - Keeps llama.rn inference in the dedicated Android `:inference` process.
-            - Persists inference-process Pss_File, Pss_Anon, RSS, SwapPss and system-memory samples throughout loading and generation.
-            - Preserves the final memory sample when HyperOS force-stops the package, so it can be read after reopening the app.
-            - Adds an optional low-residency mode that periodically invokes POSIX_FADV_DONTNEED through a tiny JNI/Bionic bridge for the active GGUF file.
-            - Leaves the experiment disabled by default and provides an accessible HyperOS preset in Settings.
+            ## HyperOS low-residency evidence follow-up
+            - Fixes the Build117 preset regression that changed V cache back to q8_0 and caused model loading failures.
+            - The low-residency button now preserves all working model parameters and only enables diagnostics/reclaim; V cache remains F16.
+            - Separates historical exits for the dedicated `:inference` process from unrelated main-process LockScreenClean records.
+            - Adds a VoiceOver-accessible action to share the complete persisted JSONL inference-memory log.
+            - Records PSS immediately before and after each reclaim operation.
+            - Uses both POSIX_FADV_DONTNEED and MADV_DONTNEED on GGUF mmap regions during the explicitly enabled experiment.
           files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
