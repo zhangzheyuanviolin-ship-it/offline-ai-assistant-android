@@ -46,19 +46,26 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Apply isolated inference routing and Build118 evidence fixes
+        id: source_patch
         run: |
-          node scripts/apply-build22-real-inference-process.mjs
-          node scripts/apply-build98-hyperos-memory.mjs
-          node scripts/apply-build118-low-residency-evidence.mjs
-          grep -F '"main": "index.js"' package.json
-          grep -F 'createRemoteLlamaContext' lib/services/model-service.ts
-          grep -F "cache_type_v: 'f16'" "app/(tabs)/settings.tsx"
-          grep -F "registerHeadlessTask('OfflineInferenceWorker'" index.js
-          grep -F 'low_residency_enabled' lib/types.ts
-          grep -F 'getInferenceDiagnosticLog' lib/services/runtime-memory.ts
-          grep -F 'performLowResidencyDrop' lib/services/inference-worker.ts
-          grep -F 'low_residency_interval_tokens: 128' "app/(tabs)/settings.tsx"
-          grep -F '分享完整推理日志' "app/(tabs)/settings.tsx"
+          set +e
+          {
+            node scripts/apply-build22-real-inference-process.mjs
+            node scripts/apply-build98-hyperos-memory.mjs
+            node scripts/apply-build118-low-residency-evidence.mjs
+            node scripts/verify-build118-source.mjs
+          } > build118-source.log 2>&1
+          status=$?
+          cat build118-source.log
+          exit $status
+
+      - name: Upload Build118 source patch error
+        if: failure() && steps.source_patch.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build118-source-patch-error
+          path: build118-source.log
+          retention-days: 7
 
       - name: Validate architecture invariants
         run: |
@@ -241,7 +248,7 @@ jobs:
             - Fixes the Build117 preset regression that changed V cache back to q8_0 and caused model loading failures.
             - The low-residency button now preserves all working model parameters and only enables diagnostics/reclaim; V cache remains F16.
             - Separates historical exits for the dedicated `:inference` process from unrelated main-process LockScreenClean records.
-            - Adds a VoiceOver-accessible action to share the complete persisted JSONL inference-memory log.
+            - Adds a screen-reader-accessible action to share the complete persisted JSONL inference-memory log.
             - Records PSS immediately before and after each reclaim operation.
             - Uses both POSIX_FADV_DONTNEED and MADV_DONTNEED on GGUF mmap regions during the explicitly enabled experiment.
           files: ${{ env.APK_PATH }}
